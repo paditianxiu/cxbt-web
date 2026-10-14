@@ -129,6 +129,7 @@ export default function ProfessionSelect({ jobId, onChoose, onCreate, onBack, on
       <button className="profession-action profession-back" style={buttonArt('button')} onClick={onBack}>
         <img src={url(assets.ui.back)} alt="" /><span>返回</span>
       </button>
+      {onResume && <button className="profession-action resume-lobby" type="button" onClick={onResume} style={{ position: 'absolute', top: 20, right: 20 }}>返回大厅</button>}
       <button className="profession-action profession-create" style={buttonArt('create')} onClick={onCreate}>开始创建</button>
       <button className="profession-action profession-settings" style={buttonArt('button')} onClick={() => setSettingsOpen(true)}>
         <img src={url(assets.ui.settings)} alt="" /><span>设置</span>

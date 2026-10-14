@@ -15,6 +15,7 @@ import { createSkillEffects } from './skillEffects';
 import { loadSkills, passiveModifiers, resolveLoadout, type BattleSlot, type LoadedSkill } from './skills';
 import SettingsMenu from '../lobby/SettingsMenu';
 import type { Skill } from '../lobby/skills';
+import { PlayerEntity, CameraController, MapCollider, getWeaponActionSuite } from './engine';
 import './Gameplay.css';
 import { WebRTCClient } from '../../network/WebRTCClient';
 
@@ -28,8 +29,12 @@ type MapDefinition = {
   fog: number[] | null;
   ambience?: string | null;
 };
-type BattleControl = { switchWeapon: (index: number) => void; fire: () => void; reload: () => void;
-  castSkill: (slot: number) => boolean };
+type BattleControl = { 
+  switchWeapon: (index: number) => void; 
+  fire: () => void; 
+  reload: () => void;
+  castSkill: (slot: number) => boolean;
+};
 type HotbarState = { cooldowns: number[]; shield: number; stealthed: boolean; speed: number; maxHealthScale: number };
 
 const BASE = `${import.meta.env.BASE_URL}assets/gameplay/`;
@@ -59,7 +64,6 @@ function BattleScene({ map, character, creation, assets, avatarPreset, weapons, 
   assets: LobbyAssets;
   avatarPreset?: CreationPreset;
   weapons: CreationWeapon[];
-  /** Mirrors the lobby quickbar so hotkeys and the HUD stay in sync. */
   slots: BattleSlot[];
   loads: LoadedSkill[];
   health: RefObject<number>;
@@ -75,7 +79,6 @@ function BattleScene({ map, character, creation, assets, avatarPreset, weapons, 
   onDamage: (amount: number) => void;
   onHeal: (amount: number) => void;
   onHotbar: (state: HotbarState) => void;
-  /** Opens the same settings UI the lobby uses when the mouse leaves the round. */
   onPause: () => void;
   otherPlayers: React.RefObject<Record<string, { buffer: {x: number, z: number, yaw: number, time: number}[] }>>;
   roomPlayers: any;
@@ -104,39 +107,19 @@ function BattleScene({ map, character, creation, assets, avatarPreset, weapons, 
   hotbarRef.current = onHotbar;
   logRef.current = logDebug;
   pauseRef.current = onPause;
+  void motion;
+  void health;
 
   useEffect(() => {
     const mount = mountRef.current;
     if (!mount) return;
     let cancelled = false;
     let frame = 0;
-    let avatar: BattleAvatar | null = null;
+    let playerAvatar: BattleAvatar | null = null;
+    let localPlayer: PlayerEntity | null = null;
+    let cameraController: CameraController | null = null;
     let visual: any = null;
     let collision: any = null;
-    let mapVisible: any[] = [];
-    let collisionMeshes: any[] = [];
-    let floorMeshes: any[] = [];
-    const replacedMaterials = new Set<any>();
-    const airWallMaterial = new THREE.MeshBasicMaterial({ transparent: true, opacity: 0, depthWrite: false, colorWrite: false });
-    const audio = createBattleAudio(map.ambience);
-    audio.start();
-    const scene = new THREE.Scene();
-    scene.background = new THREE.Color('#d9e9e9');
-    if (map.fog && map.fog.length >= 4) scene.fog = new THREE.Fog('#d9e9e9', Math.max(35, map.fog[1]), map.fog[2]);
-    const camera = new THREE.PerspectiveCamera(65, 1, 0.08, 450);
-    const renderer = new THREE.WebGLRenderer({ antialias: true });
-    renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
-    renderer.outputColorSpace = THREE.SRGBColorSpace;
-    renderer.toneMapping = THREE.ACESFilmicToneMapping;
-    renderer.toneMappingExposure = 1.55;
-    mount.appendChild(renderer.domElement);
-    scene.add(new THREE.HemisphereLight(0xe8f5ff, 0x777c6c, 2.4));
-    const sun = new THREE.DirectionalLight(0xfff0db, 2.3);
-    sun.position.set(40, 70, 45);
-    scene.add(sun);
-    const position = new THREE.Vector3(map.camera?.[0] ?? 0, 0, map.camera?.[2] ?? 0);
-    let yaw = 0;
-    let pitch = 0.1;
     let dragging = false;
     let pointerX = 0;
     let pointerY = 0;
@@ -151,31 +134,70 @@ function BattleScene({ map, character, creation, assets, avatarPreset, weapons, 
     let regenTimer = 0;
     let shotFlash = 0;
     let ready = false;
-    let grounded = false;
-    let verticalSpeed = 0;
-    let rollTime = 0;
     let audioPaused = false;
-    let footstepTime = 0;
-    let footstepIndex = 0;
-    const rollDirection = new THREE.Vector3();
     const keys = new Set<string>();
-    const raycaster = new THREE.Raycaster();
-    const down = new THREE.Vector3(0, -1, 0);
-    const direction = new THREE.Vector3();
-    const candidate = new THREE.Vector3();
-    const target = new THREE.Vector3();
     const clock = new THREE.Clock();
+
+    const audio = createBattleAudio(map.ambience);
+    audio.start();
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color('#d9e9e9');
+    if (map.fog && map.fog.length >= 4) scene.fog = new THREE.Fog('#d9e9e9', Math.max(35, map.fog[1]), map.fog[2]);
+
+    const camera = new THREE.PerspectiveCamera(65, 1, 0.08, 450);
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(devicePixelRatio, 1.5));
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 1.55;
+    mount.appendChild(renderer.domElement);
+
+    scene.add(new THREE.HemisphereLight(0xe8f5ff, 0x777c6c, 2.4));
+    const sun = new THREE.DirectionalLight(0xfff0db, 2.3);
+    sun.position.set(40, 70, 45);
+    scene.add(sun);
+
     const flash = new THREE.PointLight(0xffcf79, 0, 7);
     scene.add(flash);
+
+    // 1. 初始化地图物理碰撞与地表高程模块
+    const mapCollider = new MapCollider();
+    if (map.bounds) mapCollider.setBounds(map.bounds);
+
     const passives = passiveModifiers(loads);
+    const otherPlayerEntities = new Map<string, PlayerEntity>();
+
     const enemyList = () => {
       const list: { userId: string; position: any }[] = [];
-      for (const [userId, entry] of otherPlayerAvatars) if (entry?.root) list.push({ userId, position: entry.root.position });
+      for (const [userId, entity] of otherPlayerEntities) {
+        if (entity?.modelGroup) list.push({ userId, position: entity.modelGroup.position });
+      }
       return list;
     };
-    const projectiles = createProjectileSystem(scene, () => collisionMeshes.length ? collisionMeshes : mapVisible,
+
+    const takeDamage = (amount: number) => {
+      const reduced = amount * (1 - passives.damageReduction / 100);
+      if (passives.storeEnergy > 0) {
+        transfer.stored += reduced * passives.storeEnergy / 100;
+        if (transfer.stored >= 100 && enemyList().some((enemy) => enemy.position.distanceTo(localPlayer?.modelGroup.position || new THREE.Vector3()) <= 3)) {
+          transfer.stored = 0;
+          for (const enemy of enemyList()) {
+            if (localPlayer && enemy.position.distanceTo(localPlayer.modelGroup.position) <= passives.releaseRadius) {
+              hitRef.current(enemy.userId, passives.releaseDamage);
+            }
+          }
+        }
+      }
+      const left = skillEffects.absorb(reduced);
+      if (left > 0) damageRef.current(left);
+    };
+
+    const transfer = { stored: 0 };
+    const projectiles = createProjectileSystem(scene, () => mapCollider.collisionMeshes.length ? mapCollider.collisionMeshes : mapCollider.mapVisible,
       (point, radius) => {
-        const distance = point.distanceTo(position.clone().add(new THREE.Vector3(0, 1, 0)));
+        if (!localPlayer) return;
+        const distance = point.distanceTo(localPlayer.modelGroup.position.clone().add(new THREE.Vector3(0, 1, 0)));
         if (distance < radius) takeDamage(Math.ceil(650 * (1 - distance / radius)));
         for (const enemy of enemyList()) {
           const gap = enemy.position.distanceTo(point);
@@ -184,25 +206,11 @@ function BattleScene({ map, character, creation, assets, avatarPreset, weapons, 
           hitRef.current(enemy.userId, blast);
         }
       });
-    const transfer = { stored: 0 };
-    const takeDamage = (amount: number) => {
-      const reduced = amount * (1 - passives.damageReduction / 100);
-      if (passives.storeEnergy > 0) {
-        transfer.stored += reduced * passives.storeEnergy / 100;
-        if (transfer.stored >= 100 && enemyList().some((enemy) => enemy.position.distanceTo(position) <= 3)) {
-          transfer.stored = 0;
-          for (const enemy of enemyList()) {
-            if (enemy.position.distanceTo(position) <= passives.releaseRadius) hitRef.current(enemy.userId, passives.releaseDamage);
-          }
-        }
-      }
-      const left = skillEffects.absorb(reduced);
-      if (left > 0) damageRef.current(left);
-    };
+
     const skillEffects = createSkillEffects({
       scene,
-      position: () => position,
-      aim: () => camera.getWorldDirection(new THREE.Vector3()),
+      position: () => localPlayer?.modelGroup.position || new THREE.Vector3(),
+      aim: () => cameraController ? cameraController.getForwardDirection() : camera.getWorldDirection(new THREE.Vector3()),
       spawnProjectile: (kind, origin, aim) => projectiles.spawn(kind, origin, aim),
       playSound: (name, volume) => audio.play(name, volume),
       getMaxHealth: () => MAX_HEALTH * skillEffects.snapshot().maxHealthScale,
@@ -210,46 +218,42 @@ function BattleScene({ map, character, creation, assets, avatarPreset, weapons, 
       hurt: (amount) => damageRef.current(amount),
       enemies: enemyList,
       hitEnemy: (userId, damage) => hitRef.current(userId, damage),
-      setGhost: (on) => avatar?.setGhost(on),
+      setGhost: (on) => {
+        if (localPlayer) {
+          localPlayer.modelGroup.traverse((child: any) => {
+            if (child.isMesh && child.material) {
+              child.material.transparent = true;
+              child.material.opacity = on ? 0.35 : 1.0;
+            }
+          });
+        }
+      },
       log: (message) => logRef.current(message),
     });
 
-    const floorAt = (x: number, z: number, fromY: number) => {
-      raycaster.set(new THREE.Vector3(x, fromY, z), down);
-      raycaster.far = 100;
-      const hits = raycaster.intersectObjects(floorMeshes.length ? floorMeshes : mapVisible, true);
-      return hits.find((hit: any) => hit.face &&
-        hit.face.normal.clone().transformDirection(hit.object.matrixWorld).y > 0.35)?.point.y;
-    };
-    const blocked = (from: any, to: any) => {
-      if (!collisionMeshes.length) return false;
-      const motion = to.clone().sub(from);
-      if (motion.lengthSq() < 0.0001) return false;
-      const distance = motion.length();
-      raycaster.set(from.clone().add(new THREE.Vector3(0, 0.7, 0)), motion.normalize());
-      raycaster.far = Math.max(0.55, distance + 0.32);
-      return raycaster.intersectObjects(collisionMeshes, true).some((hit: any) => hit.distance > 0.08);
-    };
     const fire = () => {
       const family = weapons[selected]?.id.split('_')[0] ?? '';
       const kind = weaponKind(weapons[selected]?.id ?? '');
       const base = kind === 'melee' ? 430 : kind === 'grenade' ? 800 : 140;
       const delay = base * (family === 'machinegun' ? Math.max(0.35, 1 - passives.fireRate / 100) : 1);
       const now = performance.now();
-      if (!ready || !avatar || paused.current || now - lastShot < delay) return;
+      if (!ready || !localPlayer || paused.current || now - lastShot < delay) return;
       if (kind !== 'melee' && !shotRef.current()) return;
+
       skillEffects.breakStealth();
       if (comboTime > 0 && now - comboTime > 1200) comboStep = 0;
       lastShot = now;
       comboTime = now;
-      avatar.attack(kind === 'melee' ? comboStep : 0);
+
+      localPlayer.attack();
       comboStep = kind === 'melee' ? comboStep + 1 : 0;
       audio.play(`fire-${['pistol', 'sniperrifle', 'shotgun', 'smg', 'machinegun', 'knives',
         'bow', 'crossbow', 'grenadelauncher', 'grenade', 'shield', 'rpg'].includes(family)
         ? family : kind === 'melee' ? 'knives' : 'pistol'}`, 0.55);
+
       if (kind === 'melee') {
-        const aim = camera.getWorldDirection(new THREE.Vector3());
-        const point = position.clone().add(new THREE.Vector3(0, 1, 0));
+        const aim = cameraController ? cameraController.getForwardDirection() : camera.getWorldDirection(new THREE.Vector3());
+        const point = localPlayer.modelGroup.position.clone().add(new THREE.Vector3(0, 1, 0));
         for (const enemy of enemyList()) {
           const offset = enemy.position.clone().sub(point);
           const distance = offset.length();
@@ -260,34 +264,41 @@ function BattleScene({ map, character, creation, assets, avatarPreset, weapons, 
         }
         return;
       }
-      const aim = camera.getWorldDirection(new THREE.Vector3());
-      const muzzle = position.clone().add(new THREE.Vector3(Math.sin(yaw) * 0.75, 1.3, Math.cos(yaw) * 0.75));
+
+      const aim = cameraController ? cameraController.getForwardDirection() : camera.getWorldDirection(new THREE.Vector3());
+      const muzzle = localPlayer.getMuzzlePosition();
       projectiles.spawn(kind, muzzle, aim);
+
       if (kind !== 'grenade') {
         shotFlash = 0.08;
         flash.position.copy(muzzle);
         flash.intensity = 6;
-        
-        raycaster.set(camera.position, aim);
-        raycaster.far = 100;
-        const hits = raycaster.intersectObjects(collisionMeshes, true);
-        const firstHit = hits.find((h: any) => h.distance > 0.08);
-        if (firstHit && firstHit.object.userData?.isPlayer) {
+
+        const hit = mapCollider.raycastBullet(camera.position, aim, 100);
+        if (hit && hit.object.userData?.isPlayer) {
           let damage = family === 'sniperrifle' ? 85 : family === 'shotgun' ? 35 : 18;
           if (family === 'sniperrifle' && Math.random() * 100 < passives.critChance) damage *= 1 + passives.critDamage / 100;
           if (passives.weakChance > 0 && Math.random() * 100 < passives.weakChance) damage *= 1.2;
           if (family === 'sprayer' && Math.random() * 100 < passives.plagueChance) damage += passives.plagueDamage * 6;
           if (family === 'crossbow' && passives.lifesteal > 0) healRef.current(damage * passives.lifesteal / 100);
-          hitRef.current(firstHit.object.userData.userId, Math.round(damage));
+          hitRef.current(hit.object.userData.userId, Math.round(damage));
+          if (hit.object.userData.entity) {
+            hit.object.userData.entity.applyDamage(Math.round(damage));
+          }
         }
       }
     };
+
     active.current = {
       switchWeapon(index) {
         if (selected === index) return;
         selected = index;
         comboStep = 0;
-        avatar?.setWeapon(index);
+        playerAvatar?.setWeapon(index);
+        localPlayer?.switchWeaponSlot(index);
+        const suite = getWeaponActionSuite(weapons[index]?.id ?? 'smg_01');
+        void localPlayer?.loadAnimations(suite.actions);
+
         const family = weapons[index]?.id.split('_')[0] ?? '';
         audio.play(['pistol', 'sniperrifle', 'shotgun', 'smg', 'machinegun', 'knives',
           'grenade', 'rpg', 'bow', 'crossbow', 'shield', 'sprayer', 'grenadelauncher'].includes(family)
@@ -304,10 +315,17 @@ function BattleScene({ map, character, creation, assets, avatarPreset, weapons, 
       },
       reload() {
         if (weaponKind(weapons[selected]?.id ?? '') === 'melee') return;
-        avatar?.reload();
+        localPlayer?.reload();
         reloadRef.current();
       },
     };
+
+    const lockPointer = () => {
+      if (cancelled || paused.current || document.pointerLockElement) return;
+      const request = document.body.requestPointerLock() as unknown as Promise<void> | undefined;
+      if (request && typeof request.catch === 'function') void request.catch(() => undefined);
+    };
+
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLButtonElement) return;
       if (['KeyW', 'KeyA', 'KeyS', 'KeyD', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Space'].includes(event.code)) event.preventDefault();
@@ -315,23 +333,15 @@ function BattleScene({ map, character, creation, assets, avatarPreset, weapons, 
       keys.add(event.code);
       audio.start();
       if (!document.pointerLockElement) lockPointer();
-      if (event.code === 'Space' && !event.repeat && ready && grounded && !paused.current) {
-        grounded = false;
-        verticalSpeed = 7.5;
-        avatar?.jump();
-        audio.play('jump');
+
+      if (event.code === 'Space' && !event.repeat && ready && !paused.current) {
+        localPlayer?.jump();
       }
-      if ((event.code === 'ShiftLeft' || event.code === 'ControlLeft') && !event.repeat && ready && grounded && !paused.current && rollTime <= 0) {
-        rollTime = 0.45;
-        rollDirection.set(0, 0, 1);
-        if (keys.has('KeyA')) rollDirection.x = 1;
-        if (keys.has('KeyD')) rollDirection.x = -1;
-        if (keys.has('KeyS')) rollDirection.z = -1;
-        rollDirection.normalize().applyAxisAngle(THREE.Object3D.DEFAULT_UP, yaw);
-        avatar?.roll();
-        audio.play('roll');
+      if ((event.code === 'ShiftLeft' || event.code === 'ControlLeft') && !event.repeat && ready && !paused.current) {
+        localPlayer?.roll();
       }
       if (event.code === 'KeyR' && !event.repeat) active.current?.reload();
+
       if (!event.repeat) {
         const index = BATTLE_QUICK_KEYS.indexOf(event.key);
         const entry = index >= 0 ? slots[index] : undefined;
@@ -339,8 +349,10 @@ function BattleScene({ map, character, creation, assets, avatarPreset, weapons, 
         else if (entry?.kind === 'skill') active.current?.castSkill(index);
       }
     };
+
     const onKeyUp = (event: KeyboardEvent) => keys.delete(event.code);
     const onBlur = () => { keys.clear(); holding = false; };
+
     const onMove = (event: PointerEvent) => {
       const locked = document.pointerLockElement === renderer.domElement || document.pointerLockElement === document.body;
       if (!locked && !dragging) return;
@@ -348,15 +360,15 @@ function BattleScene({ map, character, creation, assets, avatarPreset, weapons, 
       const dy = locked ? event.movementY : event.clientY - pointerY;
       pointerX = event.clientX;
       pointerY = event.clientY;
-      yaw -= dx * 0.005;
-      pitch = THREE.MathUtils.clamp(pitch + dy * 0.003, -0.35, 0.65);
+      cameraController?.onMouseMove(dx, dy);
     };
+
     const onDown = (event: PointerEvent) => {
       if (paused.current) return;
-      // Pointer lock retargets mouse events, so clicks on the HUD keep their own meaning.
       if (event.target instanceof Element && event.target.closest('button, input, .settings-menu, .battle-inventory')) return;
       audio.start();
       if (event.button === 2) {
+        cameraController?.setAiming(true);
         if (!document.pointerLockElement) lockPointer();
         dragging = true;
         pointerX = event.clientX;
@@ -368,31 +380,38 @@ function BattleScene({ map, character, creation, assets, avatarPreset, weapons, 
         fire();
       }
     };
+
     const onUp = (event: PointerEvent) => {
       if (event.button === 0) holding = false;
-      if (event.button === 2) dragging = false;
+      if (event.button === 2) {
+        dragging = false;
+        cameraController?.setAiming(false);
+      }
     };
+
     const onWheel = (event: WheelEvent) => {
       event.preventDefault();
       if (paused.current || !weapons.length) return;
       active.current?.switchWeapon((selected + (event.deltaY > 0 ? 1 : weapons.length - 1)) % weapons.length);
     };
+
     const onContext = (event: MouseEvent) => event.preventDefault();
     const onLockChange = () => {
       dragging = false;
       if (document.pointerLockElement) { lockAttempts = 0; return; }
       keys.clear();
       holding = false;
-      // Escape releases the mouse, so offer the settings menu instead of firing blindly.
+      cameraController?.setAiming(false);
       if (ready && !paused.current) pauseRef.current();
     };
-    /** Chrome briefly refuses pointer lock right after Esc, so retry a few times. */
+
     const onLockError = () => {
       if (cancelled || paused.current || lockAttempts >= 3) return;
       lockAttempts += 1;
       window.clearTimeout(lockTimer);
       lockTimer = window.setTimeout(lockPointer, 1200);
     };
+
     addEventListener('keydown', onKeyDown);
     addEventListener('keyup', onKeyUp);
     addEventListener('blur', onBlur);
@@ -403,6 +422,7 @@ function BattleScene({ map, character, creation, assets, avatarPreset, weapons, 
     mount.addEventListener('contextmenu', onContext);
     document.addEventListener('pointerlockchange', onLockChange);
     document.addEventListener('pointerlockerror', onLockError);
+
     const resize = () => {
       const width = mount.clientWidth;
       const height = mount.clientHeight;
@@ -414,63 +434,70 @@ function BattleScene({ map, character, creation, assets, avatarPreset, weapons, 
     const observer = new ResizeObserver(resize);
     observer.observe(mount);
 
-    /** Re-acquires the mouse for the round; the request needs a recent user gesture. */
-    const lockPointer = () => {
-      if (cancelled || paused.current || document.pointerLockElement) return;
-      const request = document.body.requestPointerLock() as unknown as Promise<void> | undefined;
-      if (request && typeof request.catch === 'function') void request.catch(() => undefined);
-    };
     const load = async () => {
       const loader = new GLTFLoader();
-      const [mapGltf, collisionGltf, player] = await Promise.all([
+      const [mapGltf, collisionGltf, avatar] = await Promise.all([
         loader.loadAsync(`${BASE}${map.scene}`),
         map.collision ? loader.loadAsync(`${BASE}${map.collision}`).catch(() => null) : Promise.resolve(null),
         createBattleAvatar(creation, avatarPreset ?? creation.jobs[character.jobId].presets[character.appearance.gender],
           avatarPreset ? initialAppearance(avatarPreset, character.appearance.gender) : character.appearance, weapons),
       ]);
-      if (cancelled) { player.dispose(); return; }
+      if (cancelled) { avatar.dispose(); return; }
+
+      playerAvatar = avatar;
       visual = mapGltf.scene;
       collision = collisionGltf?.scene ?? null;
-      const airWalls = new Set(map.airWalls);
-      visual.traverse((object: any) => {
-        if (!(object instanceof THREE.Mesh)) return;
-        if (airWalls.has(object.name)) {
-          const materials = Array.isArray(object.material) ? object.material : [object.material];
-          materials.forEach((material: any) => replacedMaterials.add(material));
-          object.material = airWallMaterial;
-          object.userData.airWall = true;
-          return;
-        }
-        object.frustumCulled = true;
-        mapVisible.push(object);
-      });
-      collision?.traverse((object: any) => {
-        if (!(object instanceof THREE.Mesh)) return;
-        collisionMeshes.push(object);
-        if (object.userData.collision?.surfaceId !== 2) floorMeshes.push(object);
-      });
+
+      // 注册场景网格与物理碰撞
+      mapCollider.registerVisualScene(visual, map.airWalls);
+      if (collision) mapCollider.registerCollisionScene(collision);
       scene.add(visual);
-      collision?.updateMatrixWorld(true);
-      avatar = player;
-      scene.add(player.root);
-      const ground = floorAt(position.x, position.z, 80);
-      position.y = ground ?? 0;
-      grounded = ground !== undefined;
-      player.root.position.copy(position);
+
+      // 2. 主玩家实体化 (绑定 PlayerEntity 核心类)
+      localPlayer = new PlayerEntity(scene);
+      localPlayer.attachAvatarRoot(avatar.root);
+      localPlayer.setCollisionEnvironment(mapCollider.toCollisionEnvironment());
+
+      // 挂接音效与事件
+      localPlayer.events.onFootstep = (idx) => audio.play(`step${idx}`, 0.35);
+      localPlayer.events.onJump = () => audio.play('jump');
+      localPlayer.events.onLand = () => audio.play('land', 0.4);
+      localPlayer.events.onRoll = () => audio.play('roll');
+      localPlayer.events.onDamage = (dmg) => damageRef.current(dmg);
+
+      // 加载首套武器的动作预设
+      const initialSuite = getWeaponActionSuite(weapons[0]?.id ?? 'smg_01');
+      await localPlayer.loadAnimations(initialSuite.actions);
+
+      // 3. 相机控制器实例化并绑定
+      cameraController = new CameraController(camera, {
+        distance: 2.9,
+        pitch: 0.1,
+        yaw: 0,
+        heightOffset: 1.25,
+        shoulderOffset: 0.35
+      });
+      cameraController.setTarget(localPlayer.modelGroup);
+
+      const spawnX = map.camera?.[0] ?? 0;
+      const spawnZ = map.camera?.[2] ?? 0;
+      const ground = mapCollider.floorAt(spawnX, spawnZ, 80) ?? 0;
+      localPlayer.modelGroup.position.set(spawnX, ground, spawnZ);
+
       ready = true;
       readyRef.current();
-      // Grab the mouse as soon as the round loads; keys and clicks re-lock as a fallback.
       lockPointer();
     };
+
     void load().catch((error: unknown) => {
       if (!cancelled) mount.dataset.error = error instanceof Error ? error.message : '战场加载失败';
     });
-    const otherPlayerAvatars = new Map<string, any>();
 
     const animate = () => {
       frame = requestAnimationFrame(animate);
       const delta = Math.min(clock.getDelta(), 0.05);
 
+      // 多人联机对手同步与插值
       if (otherPlayers.current) {
         const renderTime = performance.now() - 100;
         for (const [userIdStr, stateObj] of Object.entries(otherPlayers.current)) {
@@ -489,7 +516,6 @@ function BattleScene({ map, character, creation, assets, avatarPreset, weapons, 
               break;
             }
           }
-
           if (!found) {
             state0 = buffer[0];
             state1 = buffer[0];
@@ -510,69 +536,48 @@ function BattleScene({ map, character, creation, assets, avatarPreset, weapons, 
             interpYaw = state0.yaw + dy * clampedT;
           }
 
-          let avatarObj = otherPlayerAvatars.get(userIdStr);
-          if (!avatarObj) {
-            // Create a dummy group to hold the avatar and hitbox immediately
-            const group = new THREE.Group();
-            scene.add(group);
-            
-            // Add collision capsule to root immediately
-            const capsuleGeom = new THREE.CapsuleGeometry(0.35, 0.9, 4, 8);
-            const capMat = new THREE.MeshBasicMaterial({ visible: false }); // Invisible hitbox
-            const hitbox = new THREE.Mesh(capsuleGeom, capMat);
-            hitbox.position.y = 0.8;
-            hitbox.userData = { isPlayer: true, userId: userIdStr };
-            group.add(hitbox);
-            collisionMeshes.push(hitbox);
-            
-            avatarObj = { root: group, update: null, loaded: false };
-            otherPlayerAvatars.set(userIdStr, avatarObj);
-            
+          let remoteEntity = otherPlayerEntities.get(userIdStr);
+          if (!remoteEntity) {
+            remoteEntity = new PlayerEntity(scene);
+            remoteEntity.hitbox.userData = { isPlayer: true, userId: userIdStr, entity: remoteEntity };
+            mapCollider.collisionMeshes.push(remoteEntity.hitbox);
+            otherPlayerEntities.set(userIdStr, remoteEntity);
+
             const pInfo = roomPlayers && roomPlayers[userIdStr];
             if (pInfo && pInfo.jobId && pInfo.appearance) {
-              const job = creation.jobs[pInfo.jobId];
+              const job = (creation.jobs as any)[pInfo.jobId];
               if (job) {
                 const preset = job.presets[pInfo.appearance.gender];
                 let pWeapons = pInfo.weaponIds ? pInfo.weaponIds.map((wId: string) => assets.weapons[wId]).filter(Boolean) : job.weapons;
                 if (!pWeapons || pWeapons.length === 0) pWeapons = job.weapons;
                 createBattleAvatar(creation, preset, pInfo.appearance, pWeapons).then(loadedAvatar => {
-                  group.add(loadedAvatar.root);
-                  avatarObj.update = loadedAvatar.update;
-                  avatarObj.loaded = true;
+                  remoteEntity!.attachAvatarRoot(loadedAvatar.root);
+                  const suite = getWeaponActionSuite(pWeapons[0]?.id ?? 'smg_01');
+                  void remoteEntity!.loadAnimations(suite.actions);
                 }).catch(err => {
-                  console.error('Avatar load error:', err);
+                  console.error('Remote player load error:', err);
                   logDebug(`[Avatar Error] ${err.message || String(err)}`);
                 });
               }
             } else {
-              // Fallback if data is missing, render red capsule
-              const mat = new THREE.MeshStandardMaterial({ color: 0xef4e54 });
-              const fallbackMesh = new THREE.Mesh(capsuleGeom, mat);
-              fallbackMesh.position.y = 0.8;
-              group.add(fallbackMesh);
-              avatarObj.loaded = true;
+              remoteEntity.loadAvatar('/assets/creation/models/malecommandos.glb', '/assets/creation/models/body01.glb').then(() => {
+                void remoteEntity!.loadAnimations(getWeaponActionSuite('smg_01').actions);
+              }).catch(() => null);
             }
           }
-          
-          if (avatarObj = otherPlayerAvatars.get(userIdStr)) {
-            const floor = floorAt(interpX, interpZ, 80) ?? 0;
-            const oldPos = avatarObj.root.position.clone();
-            avatarObj.root.position.set(interpX, floor, interpZ);
-            avatarObj.root.rotation.y = interpYaw;
-            if (avatarObj.update && avatarObj.loaded) {
-              const speed = oldPos.distanceTo(avatarObj.root.position) / delta;
-              const isMoving = speed > 0.1;
-              const charInfo = {
-                moveX: 0,
-                moveY: isMoving ? 1 : 0,
-                weapon: 0,
-                aim: new THREE.Vector3(0, 0, 1).applyEuler(new THREE.Euler(0, interpYaw, 0)),
-                grounded: true,
-                yaw: interpYaw,
-                pitch: 0,
-              };
-              avatarObj.update(delta, charInfo, false);
+
+          const floor = mapCollider.floorAt(interpX, interpZ, 80) ?? 0;
+          const oldPos = remoteEntity.modelGroup.position.clone();
+          remoteEntity.setTransform(interpX, floor, interpZ, interpYaw);
+
+          if (remoteEntity.isReady) {
+            const speed = oldPos.distanceTo(remoteEntity.modelGroup.position) / delta;
+            if (speed > 0.1) {
+              remoteEntity.playAction('run', 0.15, true);
+            } else {
+              remoteEntity.playAction('idle', 0.15, true);
             }
+            if (remoteEntity.mixer) remoteEntity.mixer.update(delta);
           }
         }
       }
@@ -582,6 +587,7 @@ function BattleScene({ map, character, creation, assets, avatarPreset, weapons, 
         if (audioPaused) audio.pause();
         else audio.start();
       }
+
       if (holding && ready && !paused.current) fire();
       skillEffects.update(delta);
       if (passives.regenPerTick > 0) {
@@ -591,82 +597,51 @@ function BattleScene({ map, character, creation, assets, avatarPreset, weapons, 
           if (health.current < MAX_HEALTH * 0.5) healRef.current(passives.regenPerTick);
         }
       }
-      if (avatar) {
-        direction.set(0, 0, 0);
-        if (keys.has('KeyW') || keys.has('ArrowUp')) direction.z += 1;
-        if (keys.has('KeyS') || keys.has('ArrowDown')) direction.z -= 1;
-        if (keys.has('KeyA') || keys.has('ArrowLeft')) direction.x += 1;
-        if (keys.has('KeyD') || keys.has('ArrowRight')) direction.x -= 1;
-        const moving = direction.lengthSq() > 0 || rollTime > 0;
-        avatar.setMoving(moving && !paused.current);
-        if (moving && !paused.current) {
-          if (rollTime > 0) direction.copy(rollDirection);
-          else direction.normalize().applyAxisAngle(THREE.Object3D.DEFAULT_UP, yaw);
-          candidate.copy(position).addScaledVector(direction, delta * skillEffects.speed(rollTime > 0 ? 8.5 : 4.5));
-          const bounds = map.bounds;
-          if (bounds?.length && (candidate.x < bounds[0] - bounds[2] / 2 || candidate.x > bounds[0] + bounds[2] / 2 ||
-            candidate.z < bounds[1] - bounds[3] / 2 || candidate.z > bounds[1] + bounds[3] / 2)) {
-            candidate.copy(position);
-          }
-          const floor = floorAt(candidate.x, candidate.z, position.y + (grounded ? 2.4 : 0.3));
-          if ((floor === undefined || !grounded || Math.abs(floor - position.y) < 0.65) && !blocked(position, candidate)) {
-            position.x = candidate.x;
-            position.z = candidate.z;
-            if (grounded && floor !== undefined) position.y = floor;
-          }
-          if (grounded && rollTime <= 0) {
-            footstepTime -= delta;
-            if (footstepTime <= 0) {
-              footstepIndex = (footstepIndex % 3) + 1;
-              audio.play(`step${footstepIndex}`, 0.35);
-              footstepTime = 0.34;
-            }
-          }
-        }
-        if (!moving) footstepTime = 0;
-        if (rollTime > 0 && !paused.current) rollTime = Math.max(0, rollTime - delta);
-        if (!grounded && !paused.current) {
-          verticalSpeed -= 18 * delta;
-          position.y += verticalSpeed * delta;
-          const floor = floorAt(position.x, position.z, position.y + 0.25);
-          if (verticalSpeed <= 0 && floor !== undefined && position.y <= floor) {
-            position.y = floor;
-            verticalSpeed = 0;
-            grounded = true;
-            audio.play('land', 0.4);
-          }
-        }
-        avatar.root.position.copy(position);
-        avatar.root.rotation.y = yaw;
-        avatar.update(delta);
-        target.copy(position).add(new THREE.Vector3(0, 1.15 + pitch, 0));
-        camera.position.copy(position).add(new THREE.Vector3(-Math.sin(yaw) * 2.9, 1.75 + pitch * 2.2, -Math.cos(yaw) * 2.9));
-        camera.lookAt(target.clone().add(new THREE.Vector3(Math.sin(yaw) * 3, 0, Math.cos(yaw) * 3)));
-        
-        // Throttle position reporting to 15 ticks per second to prevent network flood
+
+      // 主玩家输入驱动与更新
+      if (localPlayer && ready) {
+        const dir = new THREE.Vector3();
+        if (keys.has('KeyW') || keys.has('ArrowUp')) dir.z += 1;
+        if (keys.has('KeyS') || keys.has('ArrowDown')) dir.z -= 1;
+        if (keys.has('KeyA') || keys.has('ArrowLeft')) dir.x += 1;
+        if (keys.has('KeyD') || keys.has('ArrowRight')) dir.x -= 1;
+        if (dir.lengthSq() > 0) dir.normalize();
+
+        const yaw = cameraController?.yaw ?? 0;
+        localPlayer.setInput(dir, yaw, false);
+        localPlayer.update(delta);
+
+        cameraController?.update(delta, mapCollider.collisionMeshes);
+
+        const currentPos = localPlayer.modelGroup.position;
+        const currentYaw = localPlayer.modelGroup.rotation.y;
         if (performance.now() - (positionRef.current as any).lastTime > 66 || !(positionRef.current as any).lastTime) {
           (positionRef.current as any).lastTime = performance.now();
-          positionRef.current(position.x, position.z, yaw);
+          positionRef.current(currentPos.x, currentPos.z, currentYaw);
         }
       }
-      avatar?.setMotion(motion.current);
-      const hotbarNow = performance.now();
-      if (hotbarNow - lastHotbar > 150) {
-        lastHotbar = hotbarNow;
-        const snapshot = skillEffects.snapshot();
+
+      if (performance.now() - lastHotbar > 100) {
+        lastHotbar = performance.now();
+        const snap = skillEffects.snapshot();
         const bySlot = skillEffects.bySlot();
-        hotbarRef.current({ cooldowns: BATTLE_QUICK_KEYS.map((_, index) => bySlot.get(index) ?? 0),
-          shield: snapshot.shield, stealthed: snapshot.stealth > 0, speed: snapshot.speed,
-          maxHealthScale: snapshot.maxHealthScale });
+        hotbarRef.current({
+          cooldowns: BATTLE_QUICK_KEYS.map((_, index) => bySlot.get(index) ?? 0),
+          shield: snap.shield,
+          stealthed: skillEffects.isStealthed(),
+          speed: snap.speed,
+          maxHealthScale: snap.maxHealthScale,
+        });
       }
+
       if (shotFlash > 0) { shotFlash -= delta; if (shotFlash <= 0) flash.intensity = 0; }
       projectiles.update(delta);
       mount.dataset.projectileCount = String(projectiles.count());
-      mount.dataset.attackStep = String(comboStep);
-      mount.dataset.hotbar = String(slots.filter((slot) => slot.kind !== 'empty').length);
       renderer.render(scene, camera);
     };
+
     animate();
+
     return () => {
       cancelled = true;
       cancelAnimationFrame(frame);
@@ -684,39 +659,49 @@ function BattleScene({ map, character, creation, assets, avatarPreset, weapons, 
       document.removeEventListener('pointerlockerror', onLockError);
       active.current = null;
       if (document.pointerLockElement) document.exitPointerLock();
+
       audio.dispose();
       skillEffects.dispose();
       projectiles.dispose();
-      avatar?.dispose();
-      visual?.traverse((object: any) => {
-        if (object instanceof THREE.Mesh) {
-          object.geometry.dispose();
-          const materials = Array.isArray(object.material) ? object.material : [object.material];
-          materials.forEach((material: any) => material.dispose());
-        }
-      });
-      collision?.traverse((object: any) => { if (object instanceof THREE.Mesh) object.geometry.dispose(); });
-      replacedMaterials.forEach((material: any) => material.dispose());
-      airWallMaterial.dispose();
+      playerAvatar?.dispose();
+      localPlayer?.dispose();
+      for (const entity of otherPlayerEntities.values()) {
+        entity.dispose();
+      }
+      otherPlayerEntities.clear();
+      mapCollider.dispose();
+
+      if (visual) {
+        visual.traverse((object: any) => {
+          if (object instanceof THREE.Mesh) {
+            object.geometry?.dispose();
+            const mats = Array.isArray(object.material) ? object.material : [object.material];
+            mats.forEach((m: any) => m?.dispose());
+          }
+        });
+      }
+      if (collision) {
+        collision.traverse((object: any) => {
+          if (object instanceof THREE.Mesh) object.geometry?.dispose();
+        });
+      }
+
       renderer.dispose();
       renderer.forceContextLoss();
       renderer.domElement.remove();
-      mapVisible = [];
-      collisionMeshes = [];
-      floorMeshes = [];
     };
   }, [map, character, creation, avatarPreset, weapons, active, paused]);
+
   return <div className="battle-canvas" ref={mountRef} data-gameplay-canvas />;
 }
 
 export default function Gameplay({ room, character, creation, assets, avatarPreset, quickbar, skills, levels,
   volume, effectsVolume, onVolume, onEffectsVolume, onExit, onQuit = onExit }: {
-  room: RoomConfig & { id: string; players?: Record<string, any> };
+  room: RoomConfig & { id?: string; players?: Record<string, any> };
   character: SavedCharacter;
   creation: CreationAssets;
   assets: LobbyAssets;
   avatarPreset?: CreationPreset;
-  /** Slot-for-slot copy of the lobby quickbar: the battle hotbar only carries these. */
   quickbar: (string | null)[];
   skills: Skill[];
   levels: number[];
@@ -771,7 +756,6 @@ export default function Gameplay({ room, character, creation, assets, avatarPres
   const current = weapons[selected] ?? weapons[0];
   const currentKind = weaponKind(current?.id ?? '');
   const currentMagazine = current ? magazine(current) : 0;
-  /** 过激反应 raises the health ceiling for its duration. */
   const maxHealth = Math.round(MAX_HEALTH * (hotbar.maxHealthScale || 1));
   const chosenMap = mapDefinitions?.[room.mapId] ?? mapDefinitions?.level1;
   const mapArt = chosenMap?.minimap;
@@ -781,8 +765,9 @@ export default function Gameplay({ room, character, creation, assets, avatarPres
   }, [paused]);
 
   useEffect(() => {
-    const gameUrl = `${WS_BASE}?roomId=${room.id}&playerId=${myUserId}`;
-    const sigUrl = `${WS_BASE.replace('/ws', '/webrtc')}?roomId=${room.id}&playerId=${myUserId}`;
+    const roomId = room.id ?? 'default-room';
+    const gameUrl = `${WS_BASE}?roomId=${roomId}&playerId=${myUserId}`;
+    const sigUrl = `${WS_BASE.replace('/ws', '/webrtc')}?roomId=${roomId}&playerId=${myUserId}`;
     const ws = new WebRTCClient(gameUrl, sigUrl, () => {
       console.log('WebRTC Ready! Sending first sync.');
       logDebug(`[Network] WebRTC DataChannel OPENED! 握手成功`);
@@ -793,10 +778,6 @@ export default function Gameplay({ room, character, creation, assets, avatarPres
 
     ws.onMessage = (msg) => {
       try {
-        if (msg.type === 'sync') {
-          // Log explicitly for debugging visibility
-          // console.log(`Received SYNC: from userId=${msg.userId}, myUserId=${myUserId}, x=${msg.x}`);
-        }
         if (msg.type === 'tick') {
           setRemaining(msg.time_left);
           setScoreRed(msg.score_red);
@@ -827,7 +808,6 @@ export default function Gameplay({ room, character, creation, assets, avatarPres
     };
   }, [room.id, myUserId]);
 
-  // Removed network sync useEffect that was hooked to React state, which was causing severe lag.
   useEffect(() => {
     const controller = new AbortController();
     fetch(`${BASE}maps.json`, { signal: controller.signal }).then((response) => {
@@ -838,15 +818,18 @@ export default function Gameplay({ room, character, creation, assets, avatarPres
     });
     return () => controller.abort();
   }, []);
+
   useEffect(() => {
     setAmmo(weapons.map(magazine));
     setReserves(weapons.map((weapon) => magazine(weapon) * 4));
   }, [weapons]);
+
   useEffect(() => {
     if (!ready || paused || remaining <= 0) return;
     const timer = window.setInterval(() => setRemaining((value) => Math.max(0, value - 1)), 1000);
     return () => window.clearInterval(timer);
   }, [ready, paused, remaining]);
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       if (event.key === 'Escape') { event.preventDefault(); setPaused(true); }
@@ -854,11 +837,14 @@ export default function Gameplay({ room, character, creation, assets, avatarPres
     addEventListener('keydown', onKey);
     return () => removeEventListener('keydown', onKey);
   }, []);
+
   const slotForWeapon = (index: number) => slots.findIndex((slot) => slot.kind === 'weapon' && slot.weaponIndex === index);
+
   const castSkill = (slot: number) => {
     if (pausedRef.current) return;
     if (control.current?.castSkill(slot)) setSelectedSlot(slot);
   };
+
   const selectSlot = (slot: number) => {
     const entry = slots[slot];
     if (!entry) return;
@@ -871,10 +857,12 @@ export default function Gameplay({ room, character, creation, assets, avatarPres
       castSkill(slot);
     }
   };
+
   const fire = () => {
     if (pausedRef.current) return;
     control.current?.fire();
   };
+
   const onShot = () => {
     const index = selectedRef.current;
     if ((ammoRef.current[index] ?? 0) < 1) return false;
@@ -882,6 +870,7 @@ export default function Gameplay({ room, character, creation, assets, avatarPres
     setAmmo(ammoRef.current);
     return true;
   };
+
   const onReload = () => {
     const index = selectedRef.current;
     const capacity = magazine(weapons[index]);
@@ -893,27 +882,25 @@ export default function Gameplay({ room, character, creation, assets, avatarPres
     setAmmo(ammoRef.current);
     setReserves(reservesRef.current);
   };
+
   const reportPosition = (x: number, z: number, yaw: number) => {
-    // DIRECT NETWORK SEND: completely bypass React state to avoid lag spikes
     if (wsRef.current) {
       sequenceRef.current++;
       wsRef.current.sendMove(myUserId, x, z, yaw, sequenceRef.current);
     }
-    
-    // Throttle React state updates severely to just support the minimap
     setPosition((previous) => Math.abs(previous.x - x) + Math.abs(previous.z - z) + Math.abs(previous.yaw - yaw) > 2.0
       ? { x, z, yaw } : previous);
   };
+
   const bounds = chosenMap?.bounds;
   const markerX = bounds?.length ? 50 + (position.x - bounds[0]) / bounds[2] * 100 : 50;
   const markerY = bounds?.length ? 50 - (position.z - bounds[1]) / bounds[3] * 100 : 50;
 
   return <main className={`battle-root${paused ? ' paused' : ''}`} data-gameplay-ready={ready}>
-    {chosenMap && <BattleScene map={chosenMap} character={character} creation={creation} assets={assets} avatarPreset={avatarPreset}
-      weapons={weapons} slots={slots} loads={loads} health={healthRef} motion={motionRef}
+    {chosenMap && <BattleScene map={chosenMap} character={character} creation={creation} assets={assets}
+      avatarPreset={avatarPreset} weapons={weapons} slots={slots} loads={loads} health={healthRef} motion={motionRef}
       active={control} paused={pausedRef} onReady={() => setReady(true)} onPosition={reportPosition}
       otherPlayers={otherPlayersRef}
-      onPause={() => setPaused(true)}
       roomPlayers={room.players}
       logDebug={logDebug}
       onShot={onShot}
@@ -923,10 +910,18 @@ export default function Gameplay({ room, character, creation, assets, avatarPres
           wsRef.current.sendJSON({ type: 'hit', targetId: targetId, damage });
         }
       }}
-      onReload={onReload} onWeaponChange={(index) => { selectedRef.current = index; setSelected(index); setSelectedSlot(slotForWeapon(index)); }}
+      onReload={onReload}
+      onWeaponChange={(index) => {
+        selectedRef.current = index;
+        setSelected(index);
+        setSelectedSlot(slotForWeapon(index));
+      }}
+      onDamage={(amount) => setHealth((value) => Math.max(0, value - amount))}
       onHeal={(amount) => setHealth((value) => Math.min(maxHealth, value + amount))}
-      onDamage={(amount) => setHealth((value) => Math.max(0, value - amount))} />}
+      onPause={() => setPaused(true)} />}
+
     {!ready && <div className="battle-loading" role="status">{error || `${room.mapName} · 战场加载中…`}</div>}
+
     <div className="battle-reticle" aria-hidden="true"><i /><i /><i /><i /></div>
     <div className="battle-abilities" aria-label="技能状态">
       {slots.map((slot, index) => slot.kind === 'skill' && <span key={slot.key}
@@ -935,21 +930,46 @@ export default function Gameplay({ room, character, creation, assets, avatarPres
       </span>)}
       <small>{formatTime(remaining)}</small>
     </div>
-    <BattleHud scoreRed={scoreRed} scoreBlue={scoreBlue} time={formatTime(remaining)} health={health} maxHealth={maxHealth}
-      shield={hotbar.shield} ammo={ammo[selected] ?? currentMagazine} magazine={currentMagazine} melee={currentKind === 'melee'}
-      slots={slots} cooldowns={hotbar.cooldowns} selectedSlot={selectedSlot} onSelect={selectSlot} />
+
+    <BattleHud
+      scoreRed={scoreRed}
+      scoreBlue={scoreBlue}
+      time={formatTime(remaining)}
+      health={health}
+      maxHealth={maxHealth}
+      shield={hotbar.shield}
+      ammo={ammo[selected] ?? currentMagazine}
+      magazine={currentMagazine}
+      melee={currentKind === 'melee'}
+      slots={slots}
+      cooldowns={hotbar.cooldowns}
+      selectedSlot={selectedSlot}
+      onSelect={selectSlot}
+    />
+
     <aside className="battle-minimap" aria-label="小地图">
       <div className="battle-map-image" style={mapArt ? { backgroundImage: `url(${BASE}${mapArt})` } : undefined}>
         <span className="battle-map-marker" style={{ left: `${THREE.MathUtils.clamp(markerX, 5, 95)}%`, top: `${THREE.MathUtils.clamp(markerY, 5, 95)}%`, transform: `translate(-50%, -50%) rotate(${-position.yaw}rad)` }}>▲</span>
       </div>
       <span className="battle-map-name">{room.mapName}</span>
     </aside>
+
     <div className="battle-touch-controls"><button onClick={fire}>开火</button><button onClick={() => control.current?.reload()}>换弹</button></div>
     <button className="battle-menu-button" aria-label="打开菜单" title="菜单" onClick={() => setPaused(true)}>☰</button>
+
     {paused && <>
-      <SettingsMenu assets={assets} volume={volume} effectsVolume={effectsVolume} motion={motion}
-        onVolume={onVolume} onEffectsVolume={onEffectsVolume} onMotion={setMotion}
-        onClose={() => { setPaused(false); void document.body.requestPointerLock(); }} onExit={onExit} onQuit={onQuit} />
+      <SettingsMenu
+        assets={assets}
+        volume={volume}
+        effectsVolume={effectsVolume}
+        motion={motion}
+        onVolume={onVolume}
+        onEffectsVolume={onEffectsVolume}
+        onMotion={setMotion}
+        onClose={() => { setPaused(false); void document.body.requestPointerLock(); }}
+        onExit={onExit}
+        onQuit={onQuit}
+      />
       {import.meta.env.DEV && <div className="battle-debug">{debugLog.map((log, index) => <p key={index}>{log}</p>)}</div>}
     </>}
   </main>;
