@@ -150,12 +150,29 @@ func (c *Client) readPump() {
 				continue
 			}
 
+			if msgType == "objective_action" && c.RoomID != "" {
+				redDelta := 0
+				blueDelta := 0
+				if r, ok := gameMsg["redDelta"].(float64); ok {
+					redDelta = int(r)
+				}
+				if b, ok := gameMsg["blueDelta"].(float64); ok {
+					blueDelta = int(b)
+				}
+				HandleObjectiveAction(c.RoomID, redDelta, blueDelta)
+				continue
+			}
+
+
 			if msgType == "chat" {
 				sender, _ := gameMsg["userId"].(string)
 				text, _ := gameMsg["message"].(string)
+				chOverride, _ := gameMsg["channel"].(string)
 				if sender != "" && text != "" {
 					chName := "global"
-					if c.RoomID != "" {
+					if chOverride != "" {
+						chName = chOverride
+					} else if c.RoomID != "" {
 						chName = c.RoomID
 					}
 					go func(ch, s, m string) {
@@ -166,6 +183,9 @@ func (c *Client) readPump() {
 							MsgType: "chat",
 						})
 					}(chName, sender, text)
+					if chOverride == "global" || chOverride == "world" {
+						PublishChannel("global_channel", message)
+					}
 				}
 			}
 		}
@@ -173,6 +193,7 @@ func (c *Client) readPump() {
 		PublishChannel(c.Channel, message)
 	}
 }
+
 
 func (c *Client) writePump() {
 	defer func() {
