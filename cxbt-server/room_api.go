@@ -3,13 +3,151 @@ package main
 import (
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"github.com/gin-gonic/gin"
 )
 
+var (
+	playerActivityMu sync.RWMutex
+	playerLastSeen   = make(map[uint]int64)
+	reaperOnce       sync.Once
+)
+
+func TouchPlayerActivity(userID uint) {
+	if userID == 0 {
+		return
+	}
+	now := time.Now().Unix()
+	playerActivityMu.Lock()
+	playerLastSeen[userID] = now
+	playerActivityMu.Unlock()
+
+	reaperOnce.Do(func() {
+		go runRoomReaperLoop()
+	})
+}
+
+func IsPlayerRecentlyActive(userID uint, maxIdleSec int64) bool {
+	playerActivityMu.RLock()
+	last, ok := playerLastSeen[userID]
+	playerActivityMu.RUnlock()
+	if !ok {
+		return false
+	}
+	return (time.Now().Unix() - last) <= maxIdleSec
+}
+
+func RemovePlayerFromRoomAndCleanup(roomID string, userID uint) {
+	if roomID == "" || userID == 0 {
+		return
+	}
+	room, ok := GetRoomFromStore(roomID)
+	if !ok {
+		DeleteGameFromStore(roomID)
+		StopGameLoop(roomID)
+		return
+	}
+
+	if _, inRoom := room.Players[userID]; !inRoom {
+		if len(room.Players) == 0 {
+			DeleteRoomFromStore(roomID)
+			DeleteGameFromStore(roomID)
+			StopGameLoop(roomID)
+		}
+		return
+	}
+
+	delete(room.Players, userID)
+	RemoveVoiceParticipant(roomID, fmt.Sprintf("%d", userID))
+
+	if state, gOk := GetGameFromStore(roomID); gOk {
+		delete(state.Players, userID)
+		if len(state.Players) == 0 || len(room.Players) == 0 {
+			DeleteGameFromStore(roomID)
+			StopGameLoop(roomID)
+		} else {
+			SaveGameToStore(roomID, state)
+		}
+	}
+
+	if len(room.Players) == 0 {
+		DeleteRoomFromStore(roomID)
+		DeleteGameFromStore(roomID)
+		StopGameLoop(roomID)
+		PublishChannelJSON("room_channel:"+roomID, map[string]interface{}{
+			"type":   "room_closed",
+			"roomId": roomID,
+		})
+		return
+	}
+
+	if room.HostID == userID {
+		for id, p := range room.Players {
+			room.HostID = id
+			room.HostName = p.Username
+			break
+		}
+	}
+	SaveRoomToStore(room)
+	PublishChannelJSON("room_channel:"+roomID, map[string]interface{}{
+		"type":   "leave",
+		"userId": userID,
+		"room":   room,
+	})
+}
+
+func RemovePlayerFromAllOtherRooms(userID uint, keepRoomID string) {
+	if userID == 0 {
+		return
+	}
+	rooms := GetAllRoomsFromStore()
+	for _, r := range rooms {
+		if r.ID == keepRoomID {
+			continue
+		}
+		if _, exists := r.Players[userID]; exists {
+			RemovePlayerFromRoomAndCleanup(r.ID, userID)
+		}
+	}
+}
+
+func runRoomReaperLoop() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+	for range ticker.C {
+		rooms := GetAllRoomsFromStore()
+		for _, r := range rooms {
+			if len(r.Players) == 0 {
+				DeleteRoomFromStore(r.ID)
+				DeleteGameFromStore(r.ID)
+				StopGameLoop(r.ID)
+				continue
+			}
+			activeSubs := GetRoomSubCount(r.ID)
+			for uid, p := range r.Players {
+				uidStr := fmt.Sprintf("%d", uid)
+				if GetActiveWSCount(r.ID, uidStr) > 0 || (p.Username != "" && GetActiveWSCount(r.ID, p.Username) > 0) {
+					TouchPlayerActivity(uid)
+					continue
+				}
+				// While battle is actively in progress and room channel has connected peers, give a generous grace window
+				var idleLimitSec int64 = 35
+				if r.State == "Playing" || activeSubs > 0 {
+					idleLimitSec = 180
+				}
+				if !IsPlayerRecentlyActive(uid, idleLimitSec) {
+					RemovePlayerFromRoomAndCleanup(r.ID, uid)
+				}
+			}
+		}
+	}
+}
+
 func QuickMatchHandler(c *gin.Context) {
 	userID := c.MustGet("userId").(uint)
+	TouchPlayerActivity(userID)
 
 	var req struct {
 		ModeID    string   `json:"modeId"`
@@ -20,8 +158,7 @@ func QuickMatchHandler(c *gin.Context) {
 	}
 	_ = c.ShouldBindJSON(&req)
 
-	var char SavedCharacter
-	DB.Where("user_id = ?", userID).First(&char)
+	char, _ := GetCachedCharacter(userID)
 	username := char.Name
 	if username == "" {
 		username = fmt.Sprintf("Player%d", userID)
@@ -31,18 +168,22 @@ func QuickMatchHandler(c *gin.Context) {
 		level = 1
 	}
 
-	// 1. Look for waiting rooms
+	// 1. Look for available rooms with space
 	rooms := GetAllRoomsFromStore()
 	for _, room := range rooms {
-		if room.State == "Waiting" && len(room.Players) < room.MaxPlayers && room.Password == "" {
+		if len(room.Players) < room.MaxPlayers && room.Password == "" {
 			if req.ModeID != "" && room.ModeID != req.ModeID {
 				continue
 			}
+			RemovePlayerFromAllOtherRooms(userID, room.ID)
 			if room.Players == nil {
 				room.Players = make(map[uint]RoomPlayer)
 			}
 			reds, blues := 0, 0
-			for _, p := range room.Players {
+			for id, p := range room.Players {
+				if id == userID {
+					continue
+				}
 				if p.Team == "red" {
 					reds++
 				} else {
@@ -50,7 +191,7 @@ func QuickMatchHandler(c *gin.Context) {
 				}
 			}
 			team := "red"
-			if blues < reds && room.BalanceTeams {
+			if blues < reds {
 				team = "blue"
 			}
 			room.Players[userID] = RoomPlayer{
@@ -58,23 +199,30 @@ func QuickMatchHandler(c *gin.Context) {
 				Username:   username,
 				Level:      level,
 				Team:       team,
-				Ready:      false,
+				Ready:      true,
 				JobID:      char.JobID,
 				Appearance: char.Appearance,
 				WeaponIds:  req.WeaponIds,
 			}
 			SaveRoomToStore(room)
+			EnsurePlayerInGameState(room.ID, userID, team)
 			PublishChannelJSON("room_channel:"+room.ID, map[string]interface{}{
-				"type":   "join",
-				"userId": userID,
-				"room":   room,
+				"type":       "join",
+				"userId":     userID,
+				"username":   username,
+				"level":      level,
+				"team":       team,
+				"jobId":      char.JobID,
+				"appearance": char.Appearance,
+				"weaponIds":  req.WeaponIds,
+				"room":       room,
 			})
 			c.JSON(http.StatusOK, gin.H{"roomId": room.ID, "room": room, "message": "已匹配进入房间"})
 			return
 		}
 	}
 
-	// 2. If no waiting room exists, auto-create one so QuickMatch always succeeds
+	// 2. If no matching room exists, create one for this player
 	modeID := req.ModeID
 	if modeID == "" {
 		modeID = "team"
@@ -89,11 +237,14 @@ func QuickMatchHandler(c *gin.Context) {
 	}
 	mapName := req.MapName
 	if mapName == "" {
-		mapName = "训练场"
+		mapName = "夺宝大厅"
 	}
 
+	newRoomID := fmt.Sprintf("room-%d", userID)
+	RemovePlayerFromAllOtherRooms(userID, newRoomID)
+
 	newRoom := RoomConfig{
-		ID:           fmt.Sprintf("room-%d", userID),
+		ID:           newRoomID,
 		Name:         fmt.Sprintf("%s的战局", username),
 		Password:     "",
 		MaxPlayers:   16,
@@ -111,7 +262,7 @@ func QuickMatchHandler(c *gin.Context) {
 				Username:   username,
 				Level:      level,
 				Team:       "red",
-				Ready:      false,
+				Ready:      true,
 				JobID:      char.JobID,
 				Appearance: char.Appearance,
 				WeaponIds:  req.WeaponIds,
@@ -125,6 +276,7 @@ func QuickMatchHandler(c *gin.Context) {
 
 func JoinRoomHandler(c *gin.Context) {
 	userID := c.MustGet("userId").(uint)
+	TouchPlayerActivity(userID)
 	roomID := c.Param("id")
 
 	var req struct {
@@ -139,10 +291,6 @@ func JoinRoomHandler(c *gin.Context) {
 		return
 	}
 
-	if room.State != "Waiting" {
-		c.JSON(http.StatusForbidden, gin.H{"error": "Game already started"})
-		return
-	}
 	if room.Password != "" && room.Password != req.Password {
 		c.JSON(http.StatusForbidden, gin.H{"error": "Invalid password"})
 		return
@@ -152,8 +300,9 @@ func JoinRoomHandler(c *gin.Context) {
 		return
 	}
 
-	var char SavedCharacter
-	DB.Where("user_id = ?", userID).First(&char)
+	RemovePlayerFromAllOtherRooms(userID, roomID)
+
+	char, _ := GetCachedCharacter(userID)
 	username := char.Name
 	if username == "" {
 		username = fmt.Sprintf("Player%d", userID)
@@ -175,7 +324,7 @@ func JoinRoomHandler(c *gin.Context) {
 		}
 	}
 	assignedTeam := "red"
-	if blues < reds && room.BalanceTeams {
+	if blues < reds {
 		assignedTeam = "blue"
 	}
 
@@ -187,17 +336,26 @@ func JoinRoomHandler(c *gin.Context) {
 		Username:   username,
 		Level:      level,
 		Team:       assignedTeam,
-		Ready:      false,
+		Ready:      true,
 		JobID:      char.JobID,
 		Appearance: char.Appearance,
 		WeaponIds:  req.WeaponIds,
 	}
 
 	SaveRoomToStore(room)
+	if room.State == "Playing" {
+		EnsurePlayerInGameState(roomID, userID, assignedTeam)
+	}
 	PublishChannelJSON("room_channel:"+roomID, map[string]interface{}{
-		"type":   "join",
-		"userId": userID,
-		"room":   room,
+		"type":       "join",
+		"userId":     userID,
+		"username":   username,
+		"level":      level,
+		"team":       assignedTeam,
+		"jobId":      char.JobID,
+		"appearance": char.Appearance,
+		"weaponIds":  req.WeaponIds,
+		"room":       room,
 	})
 
 	c.JSON(http.StatusOK, room)
@@ -205,6 +363,7 @@ func JoinRoomHandler(c *gin.Context) {
 
 func UpdateRoomHandler(c *gin.Context) {
 	userID := c.MustGet("userId").(uint)
+	TouchPlayerActivity(userID)
 	roomID := c.Param("id")
 
 	room, ok := GetRoomFromStore(roomID)
@@ -255,6 +414,7 @@ func UpdateRoomHandler(c *gin.Context) {
 
 func SwitchTeamHandler(c *gin.Context) {
 	userID := c.MustGet("userId").(uint)
+	TouchPlayerActivity(userID)
 	roomID := c.Param("id")
 
 	var req struct {
@@ -281,6 +441,13 @@ func SwitchTeamHandler(c *gin.Context) {
 	room.Players[userID] = player
 	SaveRoomToStore(room)
 
+	if state, gOk := GetGameFromStore(roomID); gOk {
+		if ps, pOk := state.Players[userID]; pOk && ps != nil {
+			ps.Team = req.Team
+			SaveGameToStore(roomID, state)
+		}
+	}
+
 	PublishChannelJSON("room_channel:"+roomID, map[string]interface{}{
 		"type":   "room_update",
 		"userId": userID,
@@ -291,36 +458,105 @@ func SwitchTeamHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, room)
 }
 
-func LeaveRoomHandler(c *gin.Context) {
+func ReadyRoomHandler(c *gin.Context) {
 	userID := c.MustGet("userId").(uint)
+	TouchPlayerActivity(userID)
 	roomID := c.Param("id")
 
-	if room, ok := GetRoomFromStore(roomID); ok {
-		delete(room.Players, userID)
-
-		if len(room.Players) == 0 {
-			DeleteRoomFromStore(roomID)
-		} else {
-			if room.HostID == userID {
-				for id, p := range room.Players {
-					room.HostID = id
-					room.HostName = p.Username
-					break
-				}
-			}
-			SaveRoomToStore(room)
-			PublishChannelJSON("room_channel:"+roomID, map[string]interface{}{
-				"type":   "leave",
-				"userId": userID,
-				"room":   room,
-			})
-		}
+	var req struct {
+		Ready *bool `json:"ready"`
 	}
-	c.JSON(http.StatusOK, gin.H{"status": "left"})
+	_ = c.ShouldBindJSON(&req)
+
+	room, ok := GetRoomFromStore(roomID)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Room not found"})
+		return
+	}
+
+	player, exists := room.Players[userID]
+	if !exists {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Not in room"})
+		return
+	}
+
+	if req.Ready != nil {
+		player.Ready = *req.Ready
+	} else {
+		player.Ready = !player.Ready
+	}
+	room.Players[userID] = player
+	SaveRoomToStore(room)
+
+	PublishChannelJSON("room_channel:"+roomID, map[string]interface{}{
+		"type":   "room_update",
+		"userId": userID,
+		"ready":  player.Ready,
+		"room":   room,
+	})
+
+	c.JSON(http.StatusOK, room)
 }
 
-func StartGameHandler(c *gin.Context) {
+func KickRoomPlayerHandler(c *gin.Context) {
 	userID := c.MustGet("userId").(uint)
+	TouchPlayerActivity(userID)
+	roomID := c.Param("id")
+
+	var req struct {
+		TargetID     uint   `json:"targetId"`
+		TargetUserID uint   `json:"targetUserId"`
+		Username     string `json:"username"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	room, ok := GetRoomFromStore(roomID)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Room not found"})
+		return
+	}
+	if room.HostID != userID {
+		c.JSON(http.StatusForbidden, gin.H{"error": "只有房主可以踢出玩家"})
+		return
+	}
+
+	targetUID := req.TargetID
+	if targetUID == 0 {
+		targetUID = req.TargetUserID
+	}
+	if targetUID == 0 && req.Username != "" {
+		for id, p := range room.Players {
+			if p.Username == req.Username {
+				targetUID = id
+				break
+			}
+		}
+	}
+	if targetUID == 0 || targetUID == userID {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid target player"})
+		return
+	}
+
+	targetPlayer := room.Players[targetUID]
+	PublishChannelJSON("room_channel:"+roomID, map[string]interface{}{
+		"type":         "kicked",
+		"targetId":     targetUID,
+		"targetUserId": targetUID,
+		"targetName":   targetPlayer.Username,
+		"byHost":       room.HostName,
+	})
+	RemovePlayerFromRoomAndCleanup(roomID, targetUID)
+
+	updatedRoom, _ := GetRoomFromStore(roomID)
+	c.JSON(http.StatusOK, updatedRoom)
+}
+
+func WatchRoomHandler(c *gin.Context) {
+	userID := c.MustGet("userId").(uint)
+	TouchPlayerActivity(userID)
 	roomID := c.Param("id")
 
 	room, ok := GetRoomFromStore(roomID)
@@ -329,17 +565,56 @@ func StartGameHandler(c *gin.Context) {
 		return
 	}
 
+	room.WatchCount++
+	SaveRoomToStore(room)
+	PublishChannelJSON("room_channel:"+roomID, map[string]interface{}{
+		"type": "room_update",
+		"room": room,
+	})
+
+	c.JSON(http.StatusOK, room)
+}
+
+func LeaveRoomHandler(c *gin.Context) {
+	userID := c.MustGet("userId").(uint)
+	roomID := c.Param("id")
+
+	RemovePlayerFromRoomAndCleanup(roomID, userID)
+	c.JSON(http.StatusOK, gin.H{"status": "left"})
+}
+
+func StartGameHandler(c *gin.Context) {
+	userID := c.MustGet("userId").(uint)
+	TouchPlayerActivity(userID)
+	roomID := c.Param("id")
+
+	room, ok := GetRoomFromStore(roomID)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": "Room not found"})
+		return
+	}
+
+	// 严格校验房主权限：只有当前房间房主 (room.HostID == userID) 才能发起开始游戏
 	if room.HostID != userID {
-		if p, inRoom := room.Players[userID]; inRoom {
-			room.HostID = userID
-			room.HostName = p.Username
-		} else {
-			c.JSON(http.StatusForbidden, gin.H{"error": "Only host or room member can start"})
+		// 如果房主已经开始了游戏，允许房间内其他成员同步拉取已开局房间状态进入战场
+		if room.State == "Playing" {
+			if p, inRoom := room.Players[userID]; inRoom {
+				EnsurePlayerInGameState(roomID, userID, p.Team)
+			}
+			c.JSON(http.StatusOK, gin.H{"status": "started", "room": room})
 			return
 		}
+		c.JSON(http.StatusForbidden, gin.H{"error": "只有房主才能开始游戏"})
+		return
 	}
 
 	room.State = "Playing"
+	if room.MapID == "" || room.MapID == "random" {
+		room.MapID = "level1"
+		if room.MapName == "" || room.MapName == "随机地图" {
+			room.MapName = "夺宝大厅"
+		}
+	}
 
 	state := GameState{
 		RoomID:    roomID,
@@ -350,6 +625,7 @@ func StartGameHandler(c *gin.Context) {
 		Players:   make(map[uint]*PlayerState),
 	}
 	for id, p := range room.Players {
+		TouchPlayerActivity(id)
 		state.Players[id] = &PlayerState{
 			UserID:  id,
 			Team:    p.Team,
@@ -367,6 +643,7 @@ func StartGameHandler(c *gin.Context) {
 
 	PublishChannelJSON("room_channel:"+roomID, map[string]interface{}{
 		"type": "start_game",
+		"room": room,
 	})
 	c.JSON(http.StatusOK, gin.H{"status": "started", "room": room})
 }
@@ -424,13 +701,9 @@ func SettleBattleHandler(c *gin.Context) {
 		return
 	}
 
-	// If room was playing and hosted by this user, reset room state to Waiting
-	if req.RoomID != "" {
-		if room, ok := GetRoomFromStore(req.RoomID); ok && room.HostID == userID {
-			room.State = "Waiting"
-			SaveRoomToStore(room)
-			DeleteGameFromStore(req.RoomID)
-		}
+	// Remove player from room when they finish & exit battle; if room is now empty, it closes automatically
+	if req.RoomID != "" && req.RoomID != "practice" {
+		RemovePlayerFromRoomAndCleanup(req.RoomID, userID)
 	}
 
 	var char SavedCharacter
@@ -468,6 +741,7 @@ func SettleBattleHandler(c *gin.Context) {
 		char.Power += 150
 	}
 	DB.Save(&char)
+	SetCachedCharacter(char)
 
 	modeName := req.ModeName
 	if modeName == "" {

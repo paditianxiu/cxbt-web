@@ -89,13 +89,17 @@ func InitDB() {
 		&AuctionListing{},
 		&MatchRecord{},
 		&ChatMessage{},
+		&BattleRoomRecord{},
+		&PlayerReport{},
+		&PlayerFeedback{},
+		&VoteKickRecord{},
 	)
 	if err != nil {
 		log.Fatalf("failed to migrate MySQL 8 database: %v", err)
 	}
 
-	seedInitialMySQLData()
-	log.Println("MySQL 8 connected and migrated successfully.")
+	purgeFakeAndStaleData()
+	log.Println("MySQL 8 connected, migrated, and cleaned of fake data.")
 
 	// Initialize Redis
 	redisAddr := getenvDefault("REDIS_ADDR", "lhit.top:9992")
@@ -115,66 +119,179 @@ func InitDB() {
 	} else {
 		RedisReady = true
 		log.Println("Redis connected successfully.")
-		// Load any existing rooms from Redis into memory cache
-		keys, err := RDB.Keys(Ctx, "room:*").Result()
-		if err == nil {
-			for _, key := range keys {
-				if val, err := RDB.Get(Ctx, key).Result(); err == nil {
-					var room RoomConfig
-					if json.Unmarshal([]byte(val), &room) == nil && room.ID != "" {
-						roomStoreMu.Lock()
-						memRooms[room.ID] = room
-						roomStoreMu.Unlock()
-					}
-				}
+		// Clear stale/fake room:* and game:* keys on server startup so no ghost rooms persist
+		if roomKeys, err := RDB.Keys(Ctx, "room:*").Result(); err == nil && len(roomKeys) > 0 {
+			_ = RDB.Del(Ctx, roomKeys...).Err()
+		}
+		if gameKeys, err := RDB.Keys(Ctx, "game:*").Result(); err == nil && len(gameKeys) > 0 {
+			_ = RDB.Del(Ctx, gameKeys...).Err()
+		}
+	}
+}
+
+func purgeFakeAndStaleData() {
+	// Clear any stale rooms from previous server runs
+	_ = DB.Unscoped().Where("1 = 1").Delete(&BattleRoomRecord{}).Error
+
+	// Remove previously seeded fake guilds and fake system auction listings
+	_ = DB.Unscoped().Where("name IN ? OR owner_name IN ?",
+		[]string{"凌云战神殿", "百变精英团", "创想先驱同盟"},
+		[]string{"星际指挥官", "暗影刺客", "蕾欧娜"},
+	).Delete(&Guild{}).Error
+
+	_ = DB.Unscoped().Where("seller_id = 0 OR seller_name IN ?",
+		[]string{"系统商会", "系统"},
+	).Delete(&AuctionListing{}).Error
+
+	// Clean up any automated test/fake users and their characters
+	var fakeUsers []User
+	if err := DB.Unscoped().Where(
+		"username LIKE 'e2e_%' OR username LIKE 'test_%' OR username LIKE 'bot_%' OR username LIKE 'fake_%' OR username LIKE 'auto_%'",
+	).Find(&fakeUsers).Error; err == nil && len(fakeUsers) > 0 {
+		ids := make([]uint, 0, len(fakeUsers))
+		for _, u := range fakeUsers {
+			ids = append(ids, u.ID)
+		}
+		_ = DB.Unscoped().Where("user_id IN ?", ids).Delete(&SavedCharacter{}).Error
+		_ = DB.Unscoped().Where("user_id IN ? OR friend_id IN ?", ids, ids).Delete(&Friend{}).Error
+		_ = DB.Unscoped().Where("user_id IN ?", ids).Delete(&GuildMember{}).Error
+		_ = DB.Unscoped().Where("receiver_id IN ? OR sender_id IN ?", ids, ids).Delete(&Mail{}).Error
+		_ = DB.Unscoped().Where("user_id IN ?", ids).Delete(&Inventory{}).Error
+		_ = DB.Unscoped().Where("user_id IN ?", ids).Delete(&ItemEnhancement{}).Error
+		_ = DB.Unscoped().Where("user_id IN ?", ids).Delete(&PlayerMission{}).Error
+		_ = DB.Unscoped().Where("user_id IN ?", ids).Delete(&MatchRecord{}).Error
+		_ = DB.Unscoped().Where("id IN ?", ids).Delete(&User{}).Error
+	}
+
+	// Clean up orphaned characters whose user no longer exists
+	_ = DB.Exec("DELETE FROM `saved_characters` WHERE `user_id` NOT IN (SELECT `id` FROM `users`)").Error
+}
+
+var (
+	charCacheMu sync.RWMutex
+	memChars    = make(map[uint]SavedCharacter)
+)
+
+func GetCachedCharacter(userID uint) (SavedCharacter, bool) {
+	if userID == 0 {
+		return SavedCharacter{}, false
+	}
+	charCacheMu.RLock()
+	ch, ok := memChars[userID]
+	charCacheMu.RUnlock()
+	if ok && ch.UserID == userID {
+		return ch, true
+	}
+	if DB != nil {
+		var dbChar SavedCharacter
+		if err := DB.Unscoped().Where("user_id = ?", userID).First(&dbChar).Error; err == nil {
+			SetCachedCharacter(dbChar)
+			return dbChar, true
+		}
+	}
+	return SavedCharacter{}, false
+}
+
+func SetCachedCharacter(ch SavedCharacter) {
+	if ch.UserID == 0 {
+		return
+	}
+	charCacheMu.Lock()
+	memChars[ch.UserID] = ch
+	charCacheMu.Unlock()
+}
+
+// --- Dual In-Memory + Async Redis/MySQL 8 Store Helpers ---
+
+func cloneRoomConfig(room RoomConfig) RoomConfig {
+	cp := room
+	if room.Players != nil {
+		cp.Players = make(map[uint]RoomPlayer, len(room.Players))
+		for k, v := range room.Players {
+			cp.Players[k] = v
+		}
+	}
+	return cp
+}
+
+func cloneGameState(state GameState) GameState {
+	cp := state
+	if state.Players != nil {
+		cp.Players = make(map[uint]*PlayerState, len(state.Players))
+		for k, v := range state.Players {
+			if v != nil {
+				pCopy := *v
+				cp.Players[k] = &pCopy
 			}
 		}
 	}
+	return cp
 }
-
-func seedInitialMySQLData() {
-	var guildCount int64
-	DB.Model(&Guild{}).Count(&guildCount)
-	if guildCount == 0 {
-		defaultGuilds := []Guild{
-			{Name: "凌云战神殿", Notice: "欢迎各位百变战友加入凌云战神殿，每日组队远征！", Level: 5, OwnerID: 1, OwnerName: "星际指挥官", MemberCount: 12},
-			{Name: "百变精英团", Notice: "专注团队竞技与夺旗排位，冲击大元帅军衔！", Level: 4, OwnerID: 2, OwnerName: "暗影刺客", MemberCount: 8},
-			{Name: "创想先驱同盟", Notice: "休闲娱乐、造型鉴赏、沙盒建造爱好者聚集地！", Level: 3, OwnerID: 3, OwnerName: "蕾欧娜", MemberCount: 19},
-		}
-		for _, g := range defaultGuilds {
-			DB.Create(&g)
-		}
-	}
-
-	var auctionCount int64
-	DB.Model(&AuctionListing{}).Where("status = ?", "Active").Count(&auctionCount)
-	if auctionCount == 0 {
-		defaultListings := []AuctionListing{
-			{SellerID: 0, SellerName: "系统商会", ItemID: "rifle_02b", ItemName: "黄金突击步枪", Category: "equipment", PriceCoins: 12800, Status: "Active"},
-			{SellerID: 0, SellerName: "系统商会", ItemID: "sniper_02c", ItemName: "星耀狙击枪", Category: "equipment", PriceCoins: 15800, Status: "Active"},
-			{SellerID: 0, SellerName: "系统商会", ItemID: "twohandgun_01c", ItemName: "雷霆重机枪", Category: "equipment", PriceCoins: 14500, Status: "Active"},
-			{SellerID: 0, SellerName: "系统商会", ItemID: "bow_01c", ItemName: "幻影复合弓", Category: "equipment", PriceCoins: 13200, Status: "Active"},
-			{SellerID: 0, SellerName: "系统商会", ItemID: "sword_01b", ItemName: "烈焰斩舰刀", Category: "equipment", PriceCoins: 11000, Status: "Active"},
-			{SellerID: 0, SellerName: "系统商会", ItemID: "wing_angel", ItemName: "炽天使之翼", Category: "equipment", PriceCoins: 25000, Status: "Active"},
-		}
-		for _, item := range defaultListings {
-			DB.Create(&item)
-		}
-	}
-}
-
-// --- Dual In-Memory + Redis Store Helpers ---
 
 func SaveRoomToStore(room RoomConfig) {
+	if len(room.Players) == 0 {
+		DeleteRoomFromStore(room.ID)
+		DeleteGameFromStore(room.ID)
+		return
+	}
+	room.UpdatedAt = time.Now().Unix()
+	snapshot := cloneRoomConfig(room)
+
 	roomStoreMu.Lock()
-	memRooms[room.ID] = room
+	memRooms[snapshot.ID] = snapshot
 	roomStoreMu.Unlock()
 
-	if RedisReady && RDB != nil {
-		if roomJSON, err := json.Marshal(room); err == nil {
-			_ = RDB.Set(Ctx, "room:"+room.ID, roomJSON, 0).Err()
+	PublishChannelJSON("global_channel", map[string]interface{}{
+		"type":   "rooms_updated",
+		"roomId": snapshot.ID,
+	})
+
+	go func(r RoomConfig) {
+		if RedisReady && RDB != nil {
+			if roomJSON, err := json.Marshal(r); err == nil {
+				_ = RDB.Set(Ctx, "room:"+r.ID, roomJSON, 0).Err()
+			}
 		}
-	}
+		if DB != nil {
+			playersBytes, _ := json.Marshal(r.Players)
+			rec := BattleRoomRecord{
+				RoomID:       r.ID,
+				Name:         r.Name,
+				Password:     r.Password,
+				MaxPlayers:   r.MaxPlayers,
+				BalanceTeams: r.BalanceTeams,
+				ModeID:       r.ModeID,
+				ModeName:     r.ModeName,
+				MapID:        r.MapID,
+				MapName:      r.MapName,
+				HostID:       r.HostID,
+				HostName:     r.HostName,
+				State:        r.State,
+				PlayerCount:  len(r.Players),
+				PlayersJSON:  string(playersBytes),
+			}
+			var existing BattleRoomRecord
+			if err := DB.Unscoped().Where("room_id = ?", r.ID).First(&existing).Error; err == nil {
+				existing.DeletedAt.Valid = false
+				existing.Name = rec.Name
+				existing.Password = rec.Password
+				existing.MaxPlayers = rec.MaxPlayers
+				existing.BalanceTeams = rec.BalanceTeams
+				existing.ModeID = rec.ModeID
+				existing.ModeName = rec.ModeName
+				existing.MapID = rec.MapID
+				existing.MapName = rec.MapName
+				existing.HostID = rec.HostID
+				existing.HostName = rec.HostName
+				existing.State = rec.State
+				existing.PlayerCount = rec.PlayerCount
+				existing.PlayersJSON = rec.PlayersJSON
+				_ = DB.Unscoped().Save(&existing).Error
+			} else {
+				_ = DB.Create(&rec).Error
+			}
+		}
+	}(snapshot)
 }
 
 func GetRoomFromStore(roomID string) (RoomConfig, bool) {
@@ -182,19 +299,12 @@ func GetRoomFromStore(roomID string) (RoomConfig, bool) {
 	room, ok := memRooms[roomID]
 	roomStoreMu.RUnlock()
 	if ok {
-		return room, true
-	}
-
-	if RedisReady && RDB != nil {
-		if val, err := RDB.Get(Ctx, "room:"+roomID).Result(); err == nil {
-			var r RoomConfig
-			if json.Unmarshal([]byte(val), &r) == nil {
-				roomStoreMu.Lock()
-				memRooms[roomID] = r
-				roomStoreMu.Unlock()
-				return r, true
-			}
+		if len(room.Players) == 0 {
+			DeleteRoomFromStore(roomID)
+			DeleteGameFromStore(roomID)
+			return RoomConfig{}, false
 		}
+		return cloneRoomConfig(room), true
 	}
 	return RoomConfig{}, false
 }
@@ -202,33 +312,51 @@ func GetRoomFromStore(roomID string) (RoomConfig, bool) {
 func GetAllRoomsFromStore() []RoomConfig {
 	roomStoreMu.RLock()
 	rooms := make([]RoomConfig, 0, len(memRooms))
-	for _, r := range memRooms {
-		rooms = append(rooms, r)
+	emptyIDs := make([]string, 0)
+	for id, r := range memRooms {
+		if len(r.Players) == 0 {
+			emptyIDs = append(emptyIDs, id)
+			continue
+		}
+		rooms = append(rooms, cloneRoomConfig(r))
 	}
 	roomStoreMu.RUnlock()
+
+	for _, id := range emptyIDs {
+		DeleteRoomFromStore(id)
+		DeleteGameFromStore(id)
+	}
 	return rooms
 }
 
 func DeleteRoomFromStore(roomID string) {
 	roomStoreMu.Lock()
+	_, existed := memRooms[roomID]
 	delete(memRooms, roomID)
 	roomStoreMu.Unlock()
 
-	if RedisReady && RDB != nil {
-		_ = RDB.Del(Ctx, "room:"+roomID).Err()
+	if existed {
+		PublishChannelJSON("global_channel", map[string]interface{}{
+			"type":   "rooms_updated",
+			"roomId": roomID,
+		})
 	}
+
+	go func(id string) {
+		if RedisReady && RDB != nil {
+			_ = RDB.Del(Ctx, "room:"+id).Err()
+		}
+		if DB != nil {
+			_ = DB.Unscoped().Where("room_id = ?", id).Delete(&BattleRoomRecord{}).Error
+		}
+	}(roomID)
 }
 
 func SaveGameToStore(roomID string, state GameState) {
+	snapshot := cloneGameState(state)
 	gameStoreMu.Lock()
-	memGames[roomID] = state
+	memGames[roomID] = snapshot
 	gameStoreMu.Unlock()
-
-	if RedisReady && RDB != nil {
-		if stateJSON, err := json.Marshal(state); err == nil {
-			_ = RDB.Set(Ctx, "game:"+roomID, stateJSON, 0).Err()
-		}
-	}
 }
 
 func GetGameFromStore(roomID string) (GameState, bool) {
@@ -236,19 +364,7 @@ func GetGameFromStore(roomID string) (GameState, bool) {
 	state, ok := memGames[roomID]
 	gameStoreMu.RUnlock()
 	if ok {
-		return state, true
-	}
-
-	if RedisReady && RDB != nil {
-		if val, err := RDB.Get(Ctx, "game:"+roomID).Result(); err == nil {
-			var st GameState
-			if json.Unmarshal([]byte(val), &st) == nil {
-				gameStoreMu.Lock()
-				memGames[roomID] = st
-				gameStoreMu.Unlock()
-				return st, true
-			}
-		}
+		return cloneGameState(state), true
 	}
 	return GameState{}, false
 }
@@ -258,9 +374,11 @@ func DeleteGameFromStore(roomID string) {
 	delete(memGames, roomID)
 	gameStoreMu.Unlock()
 
-	if RedisReady && RDB != nil {
-		_ = RDB.Del(Ctx, "game:"+roomID).Err()
-	}
+	go func(id string) {
+		if RedisReady && RDB != nil {
+			_ = RDB.Del(Ctx, "game:"+id).Err()
+		}
+	}(roomID)
 }
 
 func FlushStore() {
@@ -272,7 +390,9 @@ func FlushStore() {
 	memGames = make(map[string]GameState)
 	gameStoreMu.Unlock()
 
-	if RedisReady && RDB != nil {
-		_ = RDB.FlushAll(Ctx).Err()
-	}
+	go func() {
+		if RedisReady && RDB != nil {
+			_ = RDB.FlushAll(Ctx).Err()
+		}
+	}()
 }

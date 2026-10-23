@@ -4,6 +4,7 @@ import { lobbyUrl } from '../lobby/assets';
 import type { RoomConfig } from './CreateRoomDialog';
 import './RoomSettings.css';
 import { apiFetch, WS_BASE } from '../../api';
+import { VoiceChatManager, type VoiceManagerSnapshot } from '../../network/VoiceChatManager';
 
 type RoomSettingsProps = {
   assets: LobbyAssets;
@@ -34,27 +35,53 @@ function buttonArt(assets: LobbyAssets, key: string): CSSProperties {
 export default function RoomSettings({ assets, room, hostName, hostIcon, onLeave, onSettings, onRoomUpdate, onStart, onStatus }: RoomSettingsProps) {
   const [draft, setDraft] = useState('');
   const [messages, setMessages] = useState<string[]>([`进入房间: ${room.name}`]);
+  const voiceMgrRef = useRef<VoiceChatManager | null>(null);
+  const [voiceSnap, setVoiceSnap] = useState<VoiceManagerSnapshot | null>(null);
   const map = assets.maps.find((entry) => entry.id === room.mapId);
   const mapImage = map?.roomImage ?? map?.cover ?? (room.mapId === 'random' ? 'ui/createRoomMapRandom.png' : null);
   const slotsPerTeam = Math.min(8, Math.ceil(room.maxPlayers / 2));
   const players = Object.values((room as any).players || {}) as any[];
   const redPlayers = players.filter(p => p.team === 'red');
   const bluePlayers = players.filter(p => p.team === 'blue');
+  const mePlayer = players.find((p: any) => p.username === hostName);
+  const myPlayerId = mePlayer?.userId ? String(mePlayer.userId) : hostName;
+  const roomHostId = Number((room as any).hostId || 0);
+  const roomHostName =
+    (room as any).hostName ||
+    players.find((p: any) => Number(p.userId) === roomHostId)?.username ||
+    hostName;
+  const isMeHost = !room.id || (
+    mePlayer && roomHostId > 0
+      ? Number(mePlayer.userId) === roomHostId
+      : (room as any).hostName
+        ? (room as any).hostName === hostName
+        : false
+  );
   const startedRef = useRef(false);
   const startRef = useRef(onStart);
   const updateRef = useRef(onRoomUpdate);
   useEffect(() => { startRef.current = onStart; }, [onStart]);
   useEffect(() => { updateRef.current = onRoomUpdate; }, [onRoomUpdate]);
 
-  const enterBattle = (roomId: string) => {
+  const enterBattle = (roomId: string, directRoom?: any) => {
     if (startedRef.current) return;
     startedRef.current = true;
-    void document.body.requestPointerLock();
+    Promise.resolve(document.body.requestPointerLock?.()).catch(() => {});
+    if (directRoom && directRoom.id) {
+      startRef.current(directRoom);
+      return;
+    }
     apiFetch('/rooms').then((rooms: any) => {
       const latest = (rooms || []).find((entry: any) => entry.id === roomId);
       startRef.current(latest ?? undefined);
     }).catch(() => startRef.current());
   };
+
+  useEffect(() => {
+    if (room.id && (room as any).state === 'Playing') {
+      enterBattle(room.id, room);
+    }
+  }, [room.id, (room as any).state]);
 
   const switchTeam = async (side: 'red' | 'blue') => {
     if (!room.id) return;
@@ -64,9 +91,39 @@ export default function RoomSettings({ assets, room, hostName, hostIcon, onLeave
         body: JSON.stringify({ team: side }),
       });
       if (updated) updateRef.current?.(updated);
+      voiceMgrRef.current?.updateTeam(side);
       onStatus(`已切换至${side === 'red' ? '红队' : '蓝队'}`);
     } catch {
       // ignore if same team
+    }
+  };
+
+  const toggleReady = async () => {
+    if (!room.id) return;
+    try {
+      const nextReady = !mePlayer?.ready;
+      const updated = await apiFetch(`/rooms/${room.id}/ready`, {
+        method: 'POST',
+        body: JSON.stringify({ ready: nextReady }),
+      });
+      if (updated) updateRef.current?.(updated);
+      onStatus(nextReady ? '✅ 已准备就绪，等待房主开始游戏' : '已取消准备');
+    } catch (e: any) {
+      onStatus(e.message || '操作失败');
+    }
+  };
+
+  const kickPlayer = async (targetUserId: number, targetName: string) => {
+    if (!room.id) return;
+    try {
+      const updated = await apiFetch(`/rooms/${room.id}/kick`, {
+        method: 'POST',
+        body: JSON.stringify({ targetId: targetUserId, targetUserId }),
+      });
+      if (updated) updateRef.current?.(updated);
+      onStatus(`已将 ${targetName} 移出房间`);
+    } catch (e: any) {
+      onStatus(e.message || '踢出失败');
     }
   };
 
@@ -96,6 +153,7 @@ export default function RoomSettings({ assets, room, hostName, hostIcon, onLeave
   useEffect(() => {
     if (!room.id) return;
     const roomId = room.id;
+
     apiFetch(`/chat/history?channel=${encodeURIComponent(roomId)}`)
       .then((rows: any[]) => {
         if (Array.isArray(rows) && rows.length > 0) {
@@ -106,18 +164,54 @@ export default function RoomSettings({ assets, room, hostName, hostIcon, onLeave
         }
       })
       .catch(() => undefined);
-    const ws = new WebSocket(`${WS_BASE}?roomId=${roomId}&playerId=${encodeURIComponent(hostName)}`);
+    const ws = new WebSocket(`${WS_BASE}?roomId=${roomId}&playerId=${encodeURIComponent(myPlayerId)}`);
     (window as any)._roomWs = ws;
+
+    const voiceMgr = new VoiceChatManager({
+      roomId,
+      userId: myPlayerId,
+      username: hostName,
+      team: mePlayer?.team === 'blue' ? 'blue' : 'red',
+      externalSendJSON: (pkt) => {
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify(pkt));
+        }
+      },
+    });
+    voiceMgrRef.current = voiceMgr;
+    const unsubVoice = voiceMgr.subscribe((snap) => setVoiceSnap(snap));
+
+    ws.onopen = () => {
+      voiceMgr.sendVoiceState('voice_join');
+    };
     ws.onmessage = (e) => {
       try {
         const msg = JSON.parse(e.data);
+        if (voiceMgr.handleServerMessage(msg)) return;
+        if (msg.type === 'room_closed') {
+          onLeave();
+          return;
+        }
+        if (msg.type === 'kicked') {
+          const kickedId = String(msg.targetUserId ?? msg.targetId ?? '');
+          if (kickedId === String(myPlayerId) || msg.targetName === hostName) {
+            onStatus('您已被房主移出房间');
+            onLeave();
+            return;
+          }
+          appendRoomChat(`系统: 玩家 ${msg.targetName || kickedId} 被房主移出了房间`);
+        }
         if (msg.room) {
           updateRef.current?.(msg.room);
+          if (msg.room.state === 'Playing') {
+            enterBattle(roomId, msg.room);
+            return;
+          }
         }
         if (msg.type === 'start_game') {
-          enterBattle(roomId);
+          enterBattle(roomId, msg.room);
         } else if (msg.type === 'join' || msg.type === 'leave') {
-          appendRoomChat(`系统: 玩家 ${msg.userId} ${msg.type === 'join' ? '进入' : '离开'}了房间`);
+          appendRoomChat(`系统: 玩家 ${msg.username || msg.userId} ${msg.type === 'join' ? '进入' : '离开'}了房间`);
         } else if (msg.type === 'chat') {
           appendRoomChat(`${msg.sender || msg.userId}: ${msg.message}`);
         }
@@ -125,8 +219,68 @@ export default function RoomSettings({ assets, room, hostName, hostIcon, onLeave
         // ignore malformed message
       }
     };
-    return () => ws.close();
-  }, [room.id, hostName]);
+
+    const pollRoomTimer = window.setInterval(() => {
+      if (startedRef.current) return;
+      apiFetch('/rooms')
+        .then((list: any[]) => {
+          const found = (list || []).find((entry: any) => entry.id === roomId);
+          if (found) {
+            updateRef.current?.(found);
+            if (found.state === 'Playing') {
+              enterBattle(roomId, found);
+            }
+          }
+        })
+        .catch(() => undefined);
+    }, 2000);
+
+    const onBeforeUnload = () => {
+      if (!startedRef.current && roomId) {
+        void apiFetch(`/rooms/${roomId}/leave`, { method: 'POST', keepalive: true }).catch(() => undefined);
+      }
+    };
+    const onRoomKeyDown = (event: KeyboardEvent) => {
+      if (
+        event.target instanceof HTMLInputElement ||
+        event.target instanceof HTMLTextAreaElement ||
+        event.target instanceof HTMLSelectElement
+      ) {
+        return;
+      }
+      if (event.code === 'KeyT') {
+        event.preventDefault();
+        if (!event.repeat) {
+          void voiceMgrRef.current?.setPushToTalkPressed(true);
+          onStatus('🎙️ 正在按住 [T] 键进行房间实时语音通话...');
+        }
+      } else if (event.code === 'KeyY' && !event.repeat) {
+        event.preventDefault();
+        const willEnable = !voiceMgrRef.current?.micEnabled;
+        void voiceMgrRef.current?.toggleMicrophone();
+        onStatus(willEnable ? '🎙️ 已开启房间自由麦语音 [按 Y 关闭]' : '🔇 已关闭房间麦克风 [按 Y 开启]');
+      }
+    };
+    const onRoomKeyUp = (event: KeyboardEvent) => {
+      if (event.code === 'KeyT') {
+        void voiceMgrRef.current?.setPushToTalkPressed(false);
+      }
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    window.addEventListener('keydown', onRoomKeyDown, { capture: true });
+    window.addEventListener('keyup', onRoomKeyUp, { capture: true });
+
+    return () => {
+      window.clearInterval(pollRoomTimer);
+      window.removeEventListener('beforeunload', onBeforeUnload);
+      window.removeEventListener('keydown', onRoomKeyDown, { capture: true });
+      window.removeEventListener('keyup', onRoomKeyUp, { capture: true });
+      unsubVoice();
+      voiceMgr.destroy();
+      voiceMgrRef.current = null;
+      ws.close();
+    };
+  }, [room.id, hostName, myPlayerId]);
 
 
   return <div className="practice-room-root room-settings-root" data-room-settings-ready="true">
@@ -140,11 +294,122 @@ export default function RoomSettings({ assets, room, hostName, hostIcon, onLeave
           </div>
           <dl className="room-map-details">
             <dt>房间名称</dt><dd>{room.name}</dd>
-            <dt>房主</dt><dd>{hostName}</dd>
+            <dt>房主</dt><dd>{roomHostName}</dd>
             <dt>游戏模式</dt><dd>{room.modeName}</dd>
             <dt>游戏人数</dt><dd>{room.maxPlayers}</dd>
           </dl>
         </div>
+
+        {/* 房间备战玩家麦克风语音控制条 */}
+        <div
+          style={{
+            display: 'flex',
+            alignItems: 'center',
+            flexWrap: 'wrap',
+            gap: 4,
+            background: 'rgba(15, 23, 42, 0.88)',
+            border: `1px solid ${voiceSnap?.speaking ? '#34d399' : '#7e5634'}`,
+            borderRadius: 6,
+            padding: '4px 6px',
+            margin: '4px 8px 2px',
+            fontSize: 11,
+            color: '#f8fafc',
+          }}
+        >
+          <button
+            type="button"
+            onClick={() => void voiceMgrRef.current?.toggleMicrophone()}
+            style={{
+              padding: '2px 7px',
+              borderRadius: 4,
+              border: '1px solid',
+              borderColor: voiceSnap?.micEnabled ? '#10b981' : '#64748b',
+              background: voiceSnap?.micEnabled ? '#065f46' : '#1e293b',
+              color: '#fff',
+              fontSize: 11,
+              fontWeight: 'bold',
+              cursor: 'pointer',
+            }}
+          >
+            {voiceSnap?.micEnabled ? '🎙️ 房间麦已开 [Y]' : '🔇 开启麦克风 [Y]'}
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              voiceMgrRef.current?.setMode(voiceSnap?.mode === 'free' ? 'ptt' : 'free')
+            }
+            onPointerDown={() => {
+              if (voiceSnap?.mode !== 'free') {
+                void voiceMgrRef.current?.setPushToTalkPressed(true);
+              }
+            }}
+            onPointerUp={() => {
+              if (voiceSnap?.mode !== 'free') {
+                void voiceMgrRef.current?.setPushToTalkPressed(false);
+              }
+            }}
+            style={{
+              padding: '2px 7px',
+              borderRadius: 4,
+              border: '1px solid #38bdf8',
+              background:
+                voiceSnap?.mode === 'free'
+                  ? '#0284c7'
+                  : voiceSnap?.pttPressed
+                    ? '#059669'
+                    : '#0f172a',
+              color: '#fff',
+              fontSize: 11,
+              cursor: 'pointer',
+            }}
+          >
+            {voiceSnap?.mode === 'free'
+              ? '🔊 自由麦'
+              : voiceSnap?.pttPressed
+                ? '📡 发射中 [T]'
+                : '🎙️ 按住[T]说话'}
+          </button>
+          <button
+            type="button"
+            onClick={() =>
+              voiceMgrRef.current?.setServerLoopback(!voiceSnap?.serverLoopback)
+            }
+            style={{
+              padding: '2px 6px',
+              borderRadius: 4,
+              border: '1px solid #f59e0b',
+              background: voiceSnap?.serverLoopback ? '#78350f' : '#1e293b',
+              color: '#fef3c7',
+              fontSize: 10,
+              cursor: 'pointer',
+            }}
+            title="开启服务端耳返测试麦克风声音"
+          >
+            {voiceSnap?.serverLoopback ? '🎧 耳返中' : '🎧 耳返'}
+          </button>
+          <div
+            style={{
+              flex: 1,
+              minWidth: 38,
+              height: 6,
+              background: '#090d16',
+              borderRadius: 3,
+              overflow: 'hidden',
+              border: '1px solid #334155',
+            }}
+          >
+            <div
+              style={{
+                width: `${Math.min(100, voiceSnap?.inputVolume ?? 0)}%`,
+                height: '100%',
+                background: voiceSnap?.speaking
+                  ? 'linear-gradient(90deg, #10b981, #38bdf8)'
+                  : '#475569',
+              }}
+            />
+          </div>
+        </div>
+
         <div className="room-chat-panel" style={art(assets, 'roomChatPanel')} aria-label="房间聊天记录">
           {messages.map((message, index) => <div key={`${index}-${message}`}>{message}</div>)}
         </div>
@@ -175,13 +440,52 @@ export default function RoomSettings({ assets, room, hostName, hostIcon, onLeave
                 const occupied = !!player;
                 const available = slot < slotsPerTeam;
                 const isHost = player && player.userId === (room as any).hostId;
+                const isSpeaking = occupied && (
+                  (player.username === hostName && voiceSnap?.speaking) ||
+                  voiceSnap?.participants.some((vp) => vp.username === player.username && vp.speaking)
+                );
                 
                 return <button key={slot} className={`room-player-row${occupied ? ' occupied' : ''}`}
                   style={art(assets, side === 'red' ? 'roomRedRow' : 'roomBlueRow')}
                   aria-label={occupied ? `${player.username}，${isHost ? '房主' : '玩家'}，${side === 'red' ? '红队' : '蓝队'}` : `${side === 'red' ? '红队' : '蓝队'}空位 ${slot + 1}`}
                   disabled={!available || occupied} onClick={() => void switchTeam(side)}>
-                  {occupied && <><img className="room-player-job" src={hostIcon} alt="" /><span className="room-player-name">LV {player.level || 1} {player.username}</span>
-                    {isHost && <img className="room-player-host" src={lobbyUrl(assets.ui.roomHost)} alt="房主" />}</>}
+                  {occupied && <>
+                    <img className="room-player-job" src={hostIcon} alt="" />
+                    <span className="room-player-name">
+                      LV {player.level || 1} {player.username} {isSpeaking ? '🔊' : ''}
+                      {!isHost && player.ready && (
+                        <span style={{ marginLeft: 6, fontSize: 10, padding: '1px 5px', borderRadius: 3, background: '#059669', color: '#fff', fontWeight: 'bold' }}>
+                          ✓已准备
+                        </span>
+                      )}
+                    </span>
+                    {isHost && <img className="room-player-host" src={lobbyUrl(assets.ui.roomHost)} alt="房主" />}
+                    {isMeHost && !isHost && (
+                      <span
+                        role="button"
+                        tabIndex={0}
+                        title="移出房间"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          void kickPlayer(player.userId, player.username);
+                        }}
+                        style={{
+                          marginLeft: 'auto',
+                          marginRight: 6,
+                          fontSize: 10,
+                          padding: '1px 6px',
+                          borderRadius: 4,
+                          background: 'rgba(220, 38, 38, 0.85)',
+                          color: '#fff',
+                          border: '1px solid #f87171',
+                          cursor: 'pointer',
+                          pointerEvents: 'auto',
+                        }}
+                      >
+                        踢出
+                      </span>
+                    )}
+                  </>}
                 </button>;
               })}
             </div>;
@@ -211,30 +515,62 @@ export default function RoomSettings({ assets, room, hostName, hostIcon, onLeave
             }}>
             <img src={lobbyUrl(assets.ui.roomIconInvite)} alt="" />邀请
           </button>
-          <button className="room-action lobby-art-button" style={buttonArt(assets, 'practiceButton')} onClick={onSettings}>
+          <button className="room-action lobby-art-button" style={buttonArt(assets, 'practiceButton')}
+            disabled={!isMeHost}
+            title={isMeHost ? '修改房间设置' : '仅房主可修改房间设置'}
+            onClick={() => {
+              if (!isMeHost) {
+                onStatus('只有房主可以修改房间设置');
+                return;
+              }
+              onSettings();
+            }}>
             <img src={lobbyUrl(assets.ui.roomIconSetup)} alt="" />房间设置
           </button>
-          <button className="room-action room-start lobby-art-button" style={buttonArt(assets, 'practiceStart')}
-            onClick={async () => {
-              try {
-                if (room.id) {
-                  await apiFetch(`/rooms/${room.id}/start`, { method: 'POST' });
-                  for (let attempt = 0; attempt < 10 && !startedRef.current; attempt += 1) {
-                    await new Promise((resolve) => setTimeout(resolve, 750));
-                    if (startedRef.current) break;
-                    const rooms: any[] = await apiFetch('/rooms').catch(() => []);
-                    if ((rooms ?? []).some((entry: any) => entry.id === room.id && entry.state === 'Playing')) enterBattle(room.id);
+          {isMeHost ? (
+            <button className="room-action room-start lobby-art-button" style={buttonArt(assets, 'practiceStart')}
+              onClick={async () => {
+                try {
+                  if (room.id) {
+                    const res = await apiFetch(`/rooms/${room.id}/start`, { method: 'POST' });
+                    if (res?.room) {
+                      enterBattle(room.id, res.room);
+                      return;
+                    }
+                    for (let attempt = 0; attempt < 10 && !startedRef.current; attempt += 1) {
+                      await new Promise((resolve) => setTimeout(resolve, 750));
+                      if (startedRef.current) break;
+                      const rooms: any[] = await apiFetch('/rooms').catch(() => []);
+                      const found = (rooms ?? []).find((entry: any) => entry.id === room.id && entry.state === 'Playing');
+                      if (found) enterBattle(room.id, found);
+                    }
+                  } else {
+                    Promise.resolve(document.body.requestPointerLock?.()).catch(() => {});
+                    onStart();
                   }
-                } else {
-                  void document.body.requestPointerLock();
-                  onStart();
+                } catch (e: any) {
+                  onStatus(e.message || '无法开始游戏');
                 }
-              } catch (e: any) {
-                onStatus(e.message || '无法开始游戏');
-              }
-            }}>
-            <img src={lobbyUrl(assets.ui.roomIconStart)} alt="" />开始游戏
-          </button>
+              }}>
+              <img src={lobbyUrl(assets.ui.roomIconStart)} alt="" />开始游戏
+            </button>
+          ) : (
+            <button className="room-action room-start lobby-art-button" style={buttonArt(assets, 'practiceStart')}
+              onClick={() => {
+                if ((room as any).state === 'Playing' && room.id) {
+                  enterBattle(room.id, room);
+                  return;
+                }
+                void toggleReady();
+              }}>
+              <img src={lobbyUrl(assets.ui.roomIconStart)} alt="" />
+              {(room as any).state === 'Playing'
+                ? '进入战场'
+                : mePlayer?.ready
+                  ? '✓ 已准备 (等待房主)'
+                  : '准备就绪'}
+            </button>
+          )}
         </div>
       </section>
     </div>

@@ -9,10 +9,78 @@ type ClipData = {
   tracks: { name: string; positions: number[][]; rotations: number[][] }[];
 };
 
+// 下半身骨骼集合（用于构建上半身独立叠加动画，实现八方向边跑边射击/换弹）
 const LOWER_BODY_BONES = new Set([
   'root', 'pelvis', 'hip_l', 'leg_l', 'foot_l', 'toe_l', 'hip_r', 'leg_r', 'foot_r', 'toe_r'
 ]);
 
+// 八方向奔跑动作枚举（对应原版 stdrunforward / stdrunback / stdrunleft / stdrunright 等 8 个动作切片）
+export type MoveDirection =
+  | 'run'
+  | 'runback'
+  | 'runleft'
+  | 'runright'
+  | 'runforwardleft'
+  | 'runforwardright'
+  | 'runbackleft'
+  | 'runbackright';
+
+// 四方向战术翻滚动作枚举（对应原版 stdrollforward / stdrollback / stdrollleft / stdrollright）
+export type RollDirection = 'roll' | 'rollback' | 'rollleft' | 'rollright';
+
+// 额外 7 个奔跑方向后缀列表
+export const EXTRA_RUN_DIRECTIONS: MoveDirection[] = [
+  'runback',
+  'runleft',
+  'runright',
+  'runforwardleft',
+  'runforwardright',
+  'runbackleft',
+  'runbackright',
+];
+
+// 额外 3 个翻滚方向后缀列表
+export const EXTRA_ROLL_DIRECTIONS: RollDirection[] = [
+  'rollback',
+  'rollleft',
+  'rollright',
+];
+
+// 根据角色局部坐标系移动分量 (localX: 左正右负, localZ: 前正后负) 解析八方向奔跑动作名
+export function resolveMoveDirection(localX: number, localZ: number): MoveDirection {
+  if (localX * localX + localZ * localZ < 0.001) return 'run';
+  const angle = Math.atan2(localX, localZ);
+  const octant = Math.round(angle / (Math.PI / 4));
+  switch (octant) {
+    case 0:
+      return 'run';
+    case 1:
+      return 'runforwardleft';
+    case 2:
+      return 'runleft';
+    case 3:
+      return 'runbackleft';
+    case -1:
+      return 'runforwardright';
+    case -2:
+      return 'runright';
+    case -3:
+      return 'runbackright';
+    default:
+      return 'runback';
+  }
+}
+
+// 根据角色局部坐标系移动分量解析四方向翻滚动作名
+export function resolveRollDirection(localX: number, localZ: number): RollDirection {
+  if (localX * localX + localZ * localZ < 0.001) return 'roll';
+  if (Math.abs(localX) > Math.abs(localZ)) {
+    return localX > 0 ? 'rollleft' : 'rollright';
+  }
+  return localZ < 0 ? 'rollback' : 'roll';
+}
+
+// 提取仅包含上半身骨骼轨道的动画切片
 function makeUpperBodyClip(clip: any): any {
   if (!clip) return null;
   const upperTracks = clip.tracks.filter((track: any) => {
@@ -26,21 +94,33 @@ export type BattleAvatar = {
   root: any;
   skeleton?: any;
   update: (delta: number) => void;
-  setMoving: (moving: boolean) => void;
+  setMoving: (moving: boolean, direction?: MoveDirection) => void;
+  setMoveDirection?: (direction: MoveDirection) => void;
   setWeapon: (index: number) => void;
   jump: () => void;
-  roll: () => void;
-  /** Plays one hit of the weapon combo; melee weapons carry up to three hits. */
+  doubleJump?: () => void;
+  setFlying?: (flying: boolean) => void;
+  roll: (direction?: RollDirection) => void;
+  /** 播放武器攻击或近战三段连击动作 */
   attack: (step?: number) => void;
   spurt: () => void;
-  /** Fades the avatar while the stealth skill is active. */
+  hit?: () => void;
+  die?: () => void;
+  revive?: () => void;
+  playSkillAnim?: (skillAnimName: string) => Promise<void>;
+  /** 潜行隐身状态半透明材质切换 */
   setGhost: (on: boolean) => void;
-  /** Freezes or resumes the animation mixer (影像调整 · 播放角色动作). */
+  /** 冻结或恢复骨骼动画混合器 */
   setMotion: (on: boolean) => void;
   reload: () => void;
   getMuzzlePosition?: (outTarget?: any) => any;
   setAttachment?: (attachment?: CreationAttachment | null) => Promise<void>;
+  getWingTipPositions?: () => { left: any; right: any; wingId: string } | null;
   playGesture?: (animationPath: string) => Promise<void>;
+  /** 播放结算翻牌 3D 角色动作 (card_01..09.json 及 card_01..09_pose.json) */
+  playCardPose?: (cardIndex: number, poseOnly?: boolean) => Promise<void>;
+  /** 播放换装间部位展示动作 (hair / coat / pants / shoesc / danceb / character_change 等) */
+  playAvatarRoomAnim?: (animName: string) => Promise<void>;
   dispose: () => void;
 };
 
@@ -78,9 +158,16 @@ export async function createBattleAvatar(assets: CreationAssets, preset: Creatio
     object.material = material(bodyMap);
     object.frustumCulled = false;
   });
-  if (!skeleton) throw new Error('角色骨骼缺失');
+  if (!skeleton) throw new Error('Character skeleton missing');
   const bones = skeleton;
   const boneIndices = new Map<string, number>(bones.bones.map((bone: any, index: number) => [bone.name, index]));
+  root.updateMatrixWorld(true);
+  const bindQuats = new Map<string, any>();
+  for (const b of bones.bones) {
+    const q = new THREE.Quaternion();
+    b.getWorldQuaternion(q);
+    bindQuats.set(b.name, q);
+  }
   const addPart = async (path: string, partMaterial: any, offset?: number[]) => {
     const part = await loadModel(path);
     const group = new THREE.Group();
@@ -93,7 +180,7 @@ export async function createBattleAvatar(assets: CreationAssets, preset: Creatio
         const oldSkeleton = object.skeleton;
         for (let index = 0; index < indices.array.length; index += 1) {
           const target = boneIndices.get(oldSkeleton.bones[indices.array[index]].name);
-          if (target === undefined) throw new Error('角色配件骨骼缺失');
+          if (target === undefined) throw new Error('Character part bone missing');
           indices.array[index] = target;
         }
         indices.needsUpdate = true;
@@ -142,7 +229,7 @@ export async function createBattleAvatar(assets: CreationAssets, preset: Creatio
   const makeClip = (data: ClipData, name: string, boneNameSet: { has: (name: string) => boolean } = boneIndices) => {
     const rawFps = data.fps || 60;
     const effectiveFps = rawFps === 60 ? 96 : rawFps;
-    const effectiveDuration = data.duration ? data.duration * (rawFps / effectiveFps) : -1;
+    const effectiveDuration = (data.duration && data.duration > 0) ? data.duration * (rawFps / effectiveFps) : -1;
     return new THREE.AnimationClip(name, effectiveDuration,
       data.tracks.flatMap((track) => {
         if (!boneNameSet.has(track.name)) return [];
@@ -153,29 +240,75 @@ export async function createBattleAvatar(assets: CreationAssets, preset: Creatio
       }));
   };
   const fetchClip = async (path: string, name: string) => {
-    const response = await fetch(path.startsWith('gameplay:')
-      ? `${import.meta.env.BASE_URL}assets/gameplay/animations/${path.slice(9)}` : assetUrl(path));
-    if (!response.ok) throw new Error(`动画加载失败: ${name}`);
+    const resolvedUrl = path.startsWith('gameplay:')
+      ? `${import.meta.env.BASE_URL}assets/gameplay/animations/${path.slice(9)}`
+      : path.startsWith('lobby:')
+        ? `${import.meta.env.BASE_URL}assets/lobby/animations/${path.slice(6)}`
+        : assetUrl(path);
+    const response = await fetch(resolvedUrl);
+    if (!response.ok) throw new Error(`Failed to load animation: ${name}`);
     return makeClip(await response.json() as ClipData, name);
   };
+  const [commonDeathClip, commonHitClip, flyHoverClip, flyMoveClip, flyJumpClip, flyTakeoffClip] = await Promise.all([
+    fetchClip('gameplay:common-death.json', 'common-death').catch(() => null),
+    fetchClip('gameplay:common-hit.json', 'common-hit').catch(() => null),
+    fetchClip('gameplay:fly-fly.json', 'fly-hover').catch(() => null),
+    fetchClip('gameplay:fly-fly01.json', 'fly-move').catch(() => null),
+    fetchClip('gameplay:fly-jumpfly.json', 'fly-jump').catch(() => null),
+    fetchClip('gameplay:fly-takeoff.json', 'fly-takeoff').catch(() => null),
+  ]);
+  const skillClipCache = new Map<string, { full: any; upper: any }>();
+  for (const sName of ['stdblast', 'stdcatch', 'stdeat', 'stdoutcry', 'stdtleibao_01_bomboff', 'stdtleibao_01_bombon', 'stdtread']) {
+    void fetchClip(`gameplay:skill_anim-${sName}.json`, `skill-${sName}`)
+      .then((c) => {
+        if (c) skillClipCache.set(sName, { full: c, upper: makeUpperBodyClip(c) });
+      })
+      .catch(() => undefined);
+  }
+
   const entries = await Promise.all(effectiveWeapons.map(async (weapon) => {
-    const set = weapon.animation.match(/thirdperson-male-(.+)-stdidle/)?.[1] ?? weapon.id;
-    // Melee sets ship stdshoot1/2/3 as the -attack/-attack2/-attack3 combo clips.
+    const set = weapon.animation.match(/thirdperson-male-(.+)-stdidle/)?.[1]
+      ?? weapon.animation.match(/animations\/(.+)\.json$/)?.[1]
+      ?? weapon.id;
+    // 近战武器套件的 -attack/-attack2/-attack3 对应原版 stdshoot1/2/3 三段连击
     const attackSources = [weapon.actions?.attack ?? `gameplay:${set}-attack.json`,
       `gameplay:${set}-attack2.json`, `gameplay:${set}-attack3.json`];
-    const [idle, run, jump, roll, spurt, reload] = await Promise.all([
-      fetchClip(weapon.animation, `${weapon.id}-idle`),
+    const reloadSource = weapon.actions?.reload ?? `gameplay:${set}-reload.json`;
+    const [idle, run, jump, roll, spurt, reload, hit, change] = await Promise.all([
+      fetchClip(`gameplay:${set}-idle.json`, `${weapon.id}-idle`).catch(() => fetchClip(weapon.animation, `${weapon.id}-idle`)),
       fetchClip(`gameplay:${set}-run.json`, `${weapon.id}-run`).catch(() => fetchClip(weapon.animation, `${weapon.id}-run-fallback`)),
       fetchClip(`gameplay:${set}-jump.json`, `${weapon.id}-jump`).catch(() => null),
       fetchClip(`gameplay:${set}-roll.json`, `${weapon.id}-roll`).catch(() => null),
       fetchClip(`gameplay:${set}-spurt.json`, `${weapon.id}-spurt`).catch(() => null),
-      weapon.actions?.reload ? fetchClip(weapon.actions.reload, `${weapon.id}-reload`).catch(() => null) : Promise.resolve(null),
+      fetchClip(reloadSource, `${weapon.id}-reload`).catch(() => fetchClip(`gameplay:${set}-reload.json`, `${weapon.id}-reload`).catch(() => null)),
+      fetchClip(`gameplay:${set}-hit.json`, `${weapon.id}-hit`).catch(() => commonHitClip),
+      fetchClip(`gameplay:${set}-change.json`, `${weapon.id}-change`).catch(() => null),
     ]);
     const attacks = (await Promise.all(attackSources.map((path, index) =>
       fetchClip(path, `${weapon.id}-attack${index + 1}`).catch(() => null))))
       .filter((clip) => Boolean(clip));
     const upperAttacks = attacks.map(makeUpperBodyClip);
     const upperReload = makeUpperBodyClip(reload);
+    const upperChange = makeUpperBodyClip(change);
+
+    // 八方向移动与四方向翻滚动作字典（默认注入前向 run 与前向 roll，其余方向按需异步预载）
+    const dirRuns: Record<string, any> = { run };
+    const dirRolls: Record<string, any> = { roll };
+    let dirLoaded = false;
+    const loadDirectionalClips = async () => {
+      if (dirLoaded) return;
+      dirLoaded = true;
+      await Promise.all([
+        ...EXTRA_RUN_DIRECTIONS.map(async (dirKey) => {
+          const clip = await fetchClip(`gameplay:${set}-${dirKey}.json`, `${weapon.id}-${dirKey}`).catch(() => null);
+          if (clip) dirRuns[dirKey] = clip;
+        }),
+        ...EXTRA_ROLL_DIRECTIONS.map(async (rollKey) => {
+          const clip = await fetchClip(`gameplay:${set}-${rollKey}.json`, `${weapon.id}-${rollKey}`).catch(() => null);
+          if (clip) dirRolls[rollKey] = clip;
+        }),
+      ]);
+    };
 
     const parts: any[] = [];
     for (const part of weapon.parts ?? []) {
@@ -190,11 +323,11 @@ export async function createBattleAvatar(assets: CreationAssets, preset: Creatio
         });
         enhanceLoadedWeaponModel(model, weapon.id);
         const bone = bones.bones[boneIndices.get(part.bone) ?? -1];
-        if (!bone) throw new Error(`武器挂点缺失: ${part.bone}`);
+        if (!bone) throw new Error(`Weapon attachment bone missing: ${part.bone}`);
         bone.add(model);
         parts.push(model);
       } catch {
-        // Fallback handled below
+        // 部件缺失时使用下方风格化武器兜底
       }
     }
     if (parts.length === 0) {
@@ -206,14 +339,41 @@ export async function createBattleAvatar(assets: CreationAssets, preset: Creatio
         parts.push(stylized);
       }
     }
-    return { idle, run, jump, roll, reload, spurt, attacks, upperAttacks, upperReload, parts };
+    return {
+      set,
+      idle,
+      run,
+      jump,
+      roll,
+      reload,
+      spurt,
+      hit,
+      change,
+      upperChange,
+      attacks,
+      upperAttacks,
+      upperReload,
+      dirRuns,
+      dirRolls,
+      loadDirectionalClips,
+      parts,
+    };
   }));
+
   const ghostState = new Map<any, { transparent: boolean; opacity: number; depthWrite: boolean }>();
   const mixer = new THREE.AnimationMixer(root);
   let attachmentGroup: any = null;
   let attachmentMixer: any = null;
+  let wingIdleClip: any = null;
+  let wingFlyClip: any = null;
+  let wingJumpClip: any = null;
+  let wingLeftNode: any = null;
+  let wingRightNode: any = null;
+  let activeWingId = '';
   let selected = 0;
   let moving = false;
+  let moveDir: MoveDirection = 'run';
+  let flying = false;
   let action: any = null;
   let upperAction: any = null;
   let transient = 0;
@@ -238,11 +398,44 @@ export async function createBattleAvatar(assets: CreationAssets, preset: Creatio
     transient = once ? clip.duration : 0;
   };
 
+  const syncWingAnim = (mode: 'idle' | 'fly' | 'jump') => {
+    if (!attachmentMixer) return;
+    attachmentMixer.stopAllAction();
+    if (mode === 'fly') {
+      const clip = wingFlyClip ?? wingJumpClip ?? wingIdleClip;
+      if (clip) {
+        attachmentMixer.timeScale = wingFlyClip ? 1.45 : 2.35;
+        attachmentMixer.clipAction(clip).reset().play();
+      }
+    } else if (mode === 'jump') {
+      const clip = wingJumpClip ?? wingFlyClip ?? wingIdleClip;
+      if (clip) {
+        attachmentMixer.timeScale = 1.85;
+        attachmentMixer.clipAction(clip).reset().play();
+      }
+    } else if (wingIdleClip) {
+      attachmentMixer.timeScale = 1.0;
+      attachmentMixer.clipAction(wingIdleClip).reset().play();
+    }
+  };
+
+  // 获取当前下半身基础动作切片（支持飞行姿态与八方向奔跑混合）
+  const getBaseClip = () => {
+    const entry = entries[selected];
+    if (flying) {
+      return moving
+        ? (flyMoveClip ?? flyHoverClip ?? entry.run)
+        : (flyHoverClip ?? flyMoveClip ?? entry.idle);
+    }
+    if (!moving) return entry.idle;
+    return entry.dirRuns[moveDir] ?? entry.run;
+  };
+
   const playUpper = (upperClip: any, fullClip: any) => {
-    if (moving && upperClip) {
-      // 保持下半身播放 run，上半身叠加攻击/换弹动作 (边走路边射击)
-      const runClip = entries[selected].run;
-      const runAct = mixer.clipAction(runClip);
+    if ((moving || flying) && upperClip) {
+      // 保持下半身播放八方向奔跑或飞行姿态，上半身叠加攻击/换弹动作 (边移动/飞行边射击)
+      const legClip = getBaseClip();
+      const runAct = mixer.clipAction(legClip);
       if (action !== runAct) {
         runAct.reset();
         runAct.setLoop(THREE.LoopRepeat, Infinity);
@@ -268,7 +461,7 @@ export async function createBattleAvatar(assets: CreationAssets, preset: Creatio
 
   const base = () => {
     stopUpper();
-    play(moving ? entries[selected].run : entries[selected].idle);
+    play(getBaseClip());
   };
 
   const avatar: BattleAvatar = {
@@ -282,17 +475,25 @@ export async function createBattleAvatar(assets: CreationAssets, preset: Creatio
         if (transient <= 0) {
           transient = 0;
           base();
+          syncWingAnim(flying ? 'fly' : 'idle');
         }
       }
     },
-    setMoving(value) {
-      if (moving !== value) {
-        moving = value;
+    setMoving(value, direction) {
+      const nextDir: MoveDirection = direction ?? (value ? moveDir : 'run');
+      const changed = moving !== value || (value && moveDir !== nextDir);
+      moving = value;
+      if (direction) {
+        moveDir = direction;
+      } else if (!value) {
+        moveDir = 'run';
+      }
+      if (changed) {
         if (!transient) {
           base();
         } else if (upperAction) {
-          // 在上半身开火/换弹过程中切换下半身移动/待机
-          const legClip = moving ? entries[selected].run : entries[selected].idle;
+          // 在上半身开火/换弹过程中实时切换下半身八方向移动/待机/飞行姿态
+          const legClip = getBaseClip();
           const legAct = mixer.clipAction(legClip);
           if (action !== legAct) {
             legAct.reset();
@@ -304,11 +505,51 @@ export async function createBattleAvatar(assets: CreationAssets, preset: Creatio
         }
       }
     },
+    setMoveDirection(direction) {
+      if (moveDir !== direction) {
+        moveDir = direction;
+        if (moving) {
+          if (!transient) {
+            base();
+          } else if (upperAction) {
+            const legClip = getBaseClip();
+            const legAct = mixer.clipAction(legClip);
+            if (action !== legAct) {
+              legAct.reset();
+              legAct.setLoop(THREE.LoopRepeat, Infinity);
+              legAct.play();
+              if (action) legAct.crossFadeFrom(action, 0.1, true);
+              action = legAct;
+            }
+          }
+        }
+      }
+    },
+    setFlying(value) {
+      if (flying !== value) {
+        flying = value;
+        syncWingAnim(flying ? 'fly' : 'idle');
+        if (flying && flyTakeoffClip) {
+          stopUpper();
+          play(flyTakeoffClip, true);
+          transient = Math.min(0.45, flyTakeoffClip.duration);
+        } else {
+          transient = 0;
+          base();
+        }
+      }
+    },
     setWeapon(index) {
       selected = Math.max(0, Math.min(index, entries.length - 1));
       entries.forEach((entry, slot) => entry.parts.forEach((part) => { part.visible = slot === selected; }));
       transient = 0;
       base();
+      // 异步预载当前武器套件的八方向奔跑与四方向翻滚动作切片
+      void entries[selected]?.loadDirectionalClips().then(() => {
+        if (moving && !transient && moveDir !== 'run') {
+          base();
+        }
+      });
     },
     attack(step = 0) {
       const entry = entries[selected];
@@ -322,6 +563,47 @@ export async function createBattleAvatar(assets: CreationAssets, preset: Creatio
       }
     },
     spurt() { const clip = entries[selected].spurt; if (clip) { stopUpper(); play(clip, true); } },
+    hit() {
+      const clip = entries[selected]?.hit ?? commonHitClip;
+      if (clip && !moving && transient <= 0) {
+        stopUpper();
+        play(clip, true);
+      }
+    },
+    die() {
+      if (commonDeathClip) {
+        stopUpper();
+        play(commonDeathClip, true);
+      }
+    },
+    revive() {
+      stopUpper();
+      transient = 0;
+      moving = false;
+      moveDir = 'run';
+      flying = false;
+      base();
+    },
+    async playSkillAnim(skillAnimName: string) {
+      try {
+        let entry = skillClipCache.get(skillAnimName);
+        if (!entry) {
+          const full = await fetchClip(`gameplay:skill_anim-${skillAnimName}.json`, `skill-${skillAnimName}`);
+          entry = { full, upper: makeUpperBodyClip(full) };
+          skillClipCache.set(skillAnimName, entry);
+        }
+        if (entry?.full) {
+          if (skillAnimName === 'stdtread') {
+            stopUpper();
+            play(entry.full, true);
+          } else {
+            playUpper(entry.upper, entry.full);
+          }
+        }
+      } catch {
+        // 技能动画缺失时静默忽略
+      }
+    },
     setMotion(on) { mixer.timeScale = on ? 1 : 0; },
     setGhost(on) {
       root.traverse((object: any) => {
@@ -344,26 +626,79 @@ export async function createBattleAvatar(assets: CreationAssets, preset: Creatio
         playUpper(entry.upperReload, entry.reload);
       }
     },
-    jump() { if (entries[selected].jump) { stopUpper(); play(entries[selected].jump, true); } },
-    roll() { if (entries[selected].roll) { stopUpper(); play(entries[selected].roll, true); } },
+    jump() {
+      if (entries[selected].jump) {
+        stopUpper();
+        play(entries[selected].jump, true);
+      }
+      syncWingAnim('jump');
+    },
+    doubleJump() {
+      stopUpper();
+      const clip = flyJumpClip ?? entries[selected].jump;
+      if (clip) {
+        play(clip, true);
+      }
+      syncWingAnim('jump');
+    },
+    roll(direction) {
+      const entry = entries[selected];
+      // 若未显式传入翻滚方向，则根据当前八方向移动状态自动推导四向翻滚动作
+      const resolvedRollDir: RollDirection = direction ?? (moving ? (
+        moveDir === 'runback' || moveDir === 'runbackleft' || moveDir === 'runbackright'
+          ? 'rollback'
+          : moveDir === 'runleft' || moveDir === 'runforwardleft'
+            ? 'rollleft'
+            : moveDir === 'runright' || moveDir === 'runforwardright'
+              ? 'rollright'
+              : 'roll'
+      ) : 'roll');
+      const clip = entry.dirRolls[resolvedRollDir] ?? entry.roll;
+      if (clip) {
+        stopUpper();
+        play(clip, true);
+      }
+    },
     getMuzzlePosition(outTarget = new THREE.Vector3()) {
       root.updateMatrixWorld(true);
       const activeParts = entries[selected]?.parts ?? [];
       for (const part of activeParts) {
-        const fireNode = part.getObjectByName('Gun_Fire') || part.getObjectByName('gun_fire');
+        const fireNode =
+          part.getObjectByName('Gun_Fire') ||
+          part.getObjectByName('gun_fire') ||
+          part.getObjectByName('Gun_MZ') ||
+          part.getObjectByName('gun_mz') ||
+          part.getObjectByName('Gun_shot_pos');
         if (fireNode) {
           fireNode.getWorldPosition(outTarget);
           return outTarget;
         }
       }
-      const handBone = bones.bones[boneIndices.get('handweapon_r') ?? -1];
+      const handBone =
+        bones.bones[boneIndices.get('handweapon_r') ?? -1] ||
+        bones.bones[boneIndices.get('handweapon_l') ?? -1];
       if (handBone) {
         handBone.getWorldPosition(outTarget);
+        const worldQuat = new THREE.Quaternion();
+        root.getWorldQuaternion(worldQuat);
+        const fwd = new THREE.Vector3(0, 0.06, 0.42).applyQuaternion(worldQuat);
+        outTarget.add(fwd);
         return outTarget;
       }
       root.getWorldPosition(outTarget);
       outTarget.y += 1.15;
       return outTarget;
+    },
+    getWingTipPositions() {
+      if (!attachmentGroup || (!wingLeftNode && !wingRightNode)) return null;
+      root.updateMatrixWorld(true);
+      const left = new THREE.Vector3();
+      const right = new THREE.Vector3();
+      if (wingLeftNode) wingLeftNode.getWorldPosition(left);
+      else root.getWorldPosition(left);
+      if (wingRightNode) wingRightNode.getWorldPosition(right);
+      else root.getWorldPosition(right);
+      return { left, right, wingId: activeWingId || 'wing01' };
     },
     async setAttachment(attachment) {
       if (attachmentGroup && attachmentGroup.parent) {
@@ -374,6 +709,12 @@ export async function createBattleAvatar(assets: CreationAssets, preset: Creatio
         attachmentMixer.stopAllAction();
         attachmentMixer = null;
       }
+      wingIdleClip = null;
+      wingFlyClip = null;
+      wingJumpClip = null;
+      wingLeftNode = null;
+      wingRightNode = null;
+      activeWingId = '';
       if (!attachment) return;
       try {
         const [model, map] = await Promise.all([
@@ -389,30 +730,57 @@ export async function createBattleAvatar(assets: CreationAssets, preset: Creatio
           object.material = attMat;
           object.frustumCulled = false;
         });
-        const anchor = model.getObjectByName(attachment.bone);
-        const parentIndex = boneIndices.get(attachment.bone);
-        if (!anchor || parentIndex === undefined) return;
-        anchor.position.set(0, 0, 0);
-        anchor.quaternion.identity();
-        anchor.scale.set(1, 1, 1);
-        root.updateMatrixWorld(true);
+        const anchor = model.getObjectByName(attachment.bone) ?? model.children.find((c: any) => c.isBone);
+        const parentIndex = boneIndices.get(attachment.bone) ?? boneIndices.get('chest');
+        if (parentIndex === undefined) return;
+        if (anchor) {
+          anchor.position.set(0, 0, 0);
+          anchor.quaternion.identity();
+          anchor.scale.set(1, 1, 1);
+        }
         const host = bones.bones[parentIndex];
         const offset = new THREE.Group();
-        host.getWorldQuaternion(offset.quaternion).invert();
+        const bindQuat = bindQuats.get(host.name);
+        if (bindQuat) {
+          offset.quaternion.copy(bindQuat).invert();
+        } else {
+          root.updateMatrixWorld(true);
+          host.getWorldQuaternion(offset.quaternion).invert();
+        }
         offset.add(model);
         host.add(offset);
         attachmentGroup = offset;
+        activeWingId = attachment.id || 'wing01';
+        wingLeftNode = model.getObjectByName('wing_vfx_l') || model.getObjectByName('wing_l5') || model.getObjectByName('wing_l3') || model.getObjectByName('wing_l');
+        wingRightNode = model.getObjectByName('wing_vfx_r') || model.getObjectByName('wing_r5') || model.getObjectByName('wing_r3') || model.getObjectByName('wing_r');
+
         if (attachment.animation) {
-          const response = await fetch(assetUrl(attachment.animation));
-          if (response.ok) {
-            const data: ClipData = await response.json();
-            const names = new Set<string>();
-            model.traverse((object: any) => { if (object.isBone && object !== anchor) names.add(object.name); });
-            const clip = makeClip(data, attachment.id, names);
-            if (clip.tracks.length) {
-              attachmentMixer = new THREE.AnimationMixer(model);
-              attachmentMixer.clipAction(clip).play();
+          const names = new Set<string>();
+          model.traverse((object: any) => { if (object.isBone && object !== anchor) names.add(object.name); });
+          const loadWingClip = async (animPath: string, suffix: string) => {
+            try {
+              const resp = await fetch(assetUrl(animPath));
+              if (!resp.ok) return null;
+              const data: ClipData = await resp.json();
+              const clip = makeClip(data, `${attachment.id}-${suffix}`, names);
+              return clip.tracks.length ? clip : null;
+            } catch {
+              return null;
             }
+          };
+          const flyAnimPath = attachment.animation.replace(/-(idle|idle_an)\.json$/, '-fly.json');
+          const jumpAnimPath = attachment.animation.replace(/-(idle|idle_an|fly)\.json$/, '-jumpup.json');
+          const [idleC, flyC, jumpC] = await Promise.all([
+            loadWingClip(attachment.animation, 'idle'),
+            flyAnimPath !== attachment.animation ? loadWingClip(flyAnimPath, 'fly') : Promise.resolve(null),
+            jumpAnimPath !== attachment.animation ? loadWingClip(jumpAnimPath, 'jumpup') : Promise.resolve(null),
+          ]);
+          wingIdleClip = idleC;
+          wingFlyClip = flyC ?? idleC;
+          wingJumpClip = jumpC ?? flyC ?? idleC;
+          if (wingIdleClip || wingFlyClip) {
+            attachmentMixer = new THREE.AnimationMixer(model);
+            syncWingAnim(flying ? 'fly' : 'idle');
           }
         }
       } catch (err) {
@@ -426,6 +794,28 @@ export async function createBattleAvatar(assets: CreationAssets, preset: Creatio
         play(clip, true);
       } catch (err) {
         console.warn('[BattleAvatar] gesture load warning:', err);
+      }
+    },
+    async playCardPose(cardIndex: number, poseOnly = false) {
+      const safeNum = Math.max(1, Math.min(9, Math.round(cardIndex)));
+      const padded = `0${safeNum}`;
+      const suffix = poseOnly ? '_pose' : '';
+      try {
+        const clip = await fetchClip(`lobby:card/card_${padded}${suffix}.json`, `card-${padded}${suffix}`);
+        stopUpper();
+        play(clip, !poseOnly);
+      } catch (err) {
+        console.warn('[BattleAvatar] card pose load warning:', err);
+      }
+    },
+    async playAvatarRoomAnim(animName: string) {
+      const clean = animName.replace(/\.json$/i, '');
+      try {
+        const clip = await fetchClip(`lobby:avatar/${clean}.json`, `avatar-room-${clean}`);
+        stopUpper();
+        play(clip, true);
+      } catch (err) {
+        console.warn('[BattleAvatar] avatar room anim load warning:', err);
       }
     },
     dispose() {

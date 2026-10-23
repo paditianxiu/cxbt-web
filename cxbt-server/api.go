@@ -31,6 +31,9 @@ func RegisterRoutes(r *gin.Engine) {
 		protected.POST("/rooms", createRoomHandler)
 		protected.PUT("/rooms/:id", UpdateRoomHandler)
 		protected.POST("/rooms/:id/team", SwitchTeamHandler)
+		protected.POST("/rooms/:id/ready", ReadyRoomHandler)
+		protected.POST("/rooms/:id/kick", KickRoomPlayerHandler)
+		protected.POST("/rooms/:id/watch", WatchRoomHandler)
 		protected.POST("/rooms/quickmatch", QuickMatchHandler)
 		protected.POST("/rooms/:id/join", JoinRoomHandler)
 		protected.POST("/rooms/:id/leave", LeaveRoomHandler)
@@ -89,6 +92,7 @@ func getCharacterHandler(c *gin.Context) {
 	if char.Power <= 0 {
 		char.Power = 1500 + char.Level*150
 	}
+	SetCachedCharacter(char)
 
 	c.JSON(http.StatusOK, char)
 }
@@ -106,9 +110,25 @@ func saveCharacterHandler(c *gin.Context) {
 	err := DB.Unscoped().Where("user_id = ?", userID).First(&existing).Error
 	if err == nil {
 		existing.DeletedAt.Valid = false
-		existing.Name = req.Name
-		existing.JobID = req.JobID
+		if req.Name != "" {
+			existing.Name = req.Name
+		}
+		if req.JobID != "" {
+			existing.JobID = req.JobID
+		}
 		existing.Appearance = req.Appearance
+		if req.EquippedWeapons != "" {
+			existing.EquippedWeapons = req.EquippedWeapons
+		}
+		if req.ActiveWing != "" {
+			existing.ActiveWing = req.ActiveWing
+		}
+		if req.ActivePet != "" {
+			existing.ActivePet = req.ActivePet
+		}
+		if req.QuickbarJSON != "" {
+			existing.QuickbarJSON = req.QuickbarJSON
+		}
 		if existing.Level <= 0 {
 			existing.Level = 1
 		}
@@ -124,10 +144,14 @@ func saveCharacterHandler(c *gin.Context) {
 		if existing.Power <= 0 {
 			existing.Power = 1500
 		}
+		if existing.LuckDrawStamina <= 0 {
+			existing.LuckDrawStamina = 100
+		}
 		if err := DB.Unscoped().Save(&existing).Error; err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
+		SetCachedCharacter(existing)
 		c.JSON(http.StatusOK, existing)
 	} else {
 		req.UserID = userID
@@ -150,21 +174,31 @@ func saveCharacterHandler(c *gin.Context) {
 		if req.Power <= 0 {
 			req.Power = 1500
 		}
+		if req.LuckDrawStamina <= 0 {
+			req.LuckDrawStamina = 100
+		}
 		if err := DB.Create(&req).Error; err != nil {
 			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 			return
 		}
+		SetCachedCharacter(req)
 		c.JSON(http.StatusOK, req)
 	}
 }
 
 func getRoomsHandler(c *gin.Context) {
+	if val, exists := c.Get("userId"); exists {
+		if uid, ok := val.(uint); ok && uid > 0 {
+			TouchPlayerActivity(uid)
+		}
+	}
 	rooms := GetAllRoomsFromStore()
 	c.JSON(http.StatusOK, rooms)
 }
 
 func createRoomHandler(c *gin.Context) {
 	userID := c.MustGet("userId").(uint)
+	TouchPlayerActivity(userID)
 
 	var req struct {
 		RoomConfig
@@ -179,8 +213,10 @@ func createRoomHandler(c *gin.Context) {
 	config.HostID = userID
 	config.State = "Waiting"
 
-	var char SavedCharacter
-	DB.Where("user_id = ?", userID).First(&char)
+	// Remove player from any other rooms before creating this room
+	RemovePlayerFromAllOtherRooms(userID, config.ID)
+
+	char, _ := GetCachedCharacter(userID)
 	username := char.Name
 	if username == "" {
 		username = fmt.Sprintf("Player%d", userID)
@@ -197,7 +233,7 @@ func createRoomHandler(c *gin.Context) {
 		Username:   username,
 		Level:      level,
 		Team:       "red",
-		Ready:      false,
+		Ready:      true,
 		JobID:      char.JobID,
 		Appearance: char.Appearance,
 		WeaponIds:  req.WeaponIds,
@@ -206,3 +242,4 @@ func createRoomHandler(c *gin.Context) {
 	SaveRoomToStore(config)
 	c.JSON(http.StatusOK, config)
 }
+
